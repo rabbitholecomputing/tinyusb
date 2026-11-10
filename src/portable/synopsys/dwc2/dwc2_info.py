@@ -2,29 +2,35 @@
 
 import ctypes
 import argparse
-import click
 import pandas as pd
 
 # hex value for register: guid, gsnpsid, ghwcfg1, ghwcfg2, ghwcfg3, ghwcfg4
 # Note: FS is FullSpeed, HS is HighSpeed
 dwc2_reg_list = ['GUID', 'GSNPSID', 'GHWCFG1', 'GHWCFG2', 'GHWCFG3', 'GHWCFG4']
 dwc2_reg_value = {
+    'AT32 F405 FS': [0x00002000, 0x4F54400A, 0x00000000, 0x228FDD00, 0x020004E8, 0x1FF0A020],
+    'AT32 F405 HS': [0, 0x4F54400A, 0x00000000, 0x229FDDD0, 0x03F006E8, 0x1FF0A020],
+    'AT32 F415': [0x00001000, 0x4F54400A, 0x00000000, 0x228DCD00, 0x020004E8, 0x0F],
     'BCM2711 (Pi4)': [0x2708A000, 0x4F54280A, 0, 0x228DDD50, 0xFF000E8, 0x1FF00020],
     'EFM32GG': [0, 0x4F54330A, 0, 0x228F5910, 0x01F204E8, 0x1BF08030],
     'ESP32-S2/S3': [0, 0x4F54400A, 0, 0x224DD930, 0x0C804B5, 0xD3F0A030],
     'ESP32-P4': [0, 0x4F54400A, 0, 0x215FFFD0, 0x03805EB5, 0xDFF1A030],
-    'ST F207/F407/411/429 FS': [0x1200, 0x4F54281A, 0, 0x229DCD20, 0x020001E8, 0x0FF08030],
+    'ESP32-S31': [0, 0x4F54430A, 0, 0x239FFED2, 0x038046E8, 0xDE11AA30],
+    'nRF54H20': [0, 0x4F54430A, 0xAA555000, 0x228BFC72, 0x0BEAC0E8, 0x1E10AA60], # base on Preliminary Datasheet v0.7
+    'nRF54LM20': [0, 0x4F54500B, 0x00000000, 0x22AFFC52, 0x0BE0C0E8, 0x3E10AA60],
+    # ST sort by GUID
     'ST F407/429 HS': [0x1100, 0x4F54281A, 0, 0x229ED590, 0x03F403E8, 0x17F00030],
-    'ST F412/767 FS': [0x2000, 0x4F54320A, 0, 0x229ED520, 0x0200D1E8, 0x17F08030],
+    'ST F207/F407/411/429 FS': [0x1200, 0x4F54281A, 0, 0x229DCD20, 0x020001E8, 0x0FF08030],
+    'ST L476 FS': [0x2000, 0x4F54310A, 0, 0x229ED520, 0x0200D1E8, 0x17F08030],
+    'ST F412/76x FS': [0x2000, 0x4F54320A, 0, 0x229ED520, 0x0200D1E8, 0x17F08030],
+    'ST F76x HS': [0x2100, 0x4F54320A, 0, 0x229FE190, 0x03EED2E8, 0x23F00030],
+    'ST H743/H750': [0x2300, 0x4F54330A, 0, 0x229FE190, 0x03B8D2E8, 0xE3F00030],
     'ST F723/L4P5 FS': [0x3000, 0x4F54330A, 0, 0x229ED520, 0x0200D1E8, 0x17F08030],
     'ST F723 HS': [0x3100, 0x4F54330A, 0, 0x229FE1D0, 0x03EED2E8, 0x23F00030],
-    'ST F769': [0x2100, 0x4F54320A, 0, 0x229FE190, 0x03EED2E8, 0x23F00030],
-    'ST H743/H750': [0x2300, 0x4F54330A, 0, 0x229FE190, 0x03B8D2E8, 0xE3F00030],
-    'ST L476 FS': [0x2000, 0x4F54310A, 0, 0x229ED520, 0x0200D1E8, 0x17F08030],
-    'ST U5A5 HS': [0x5000, 0x4F54411A, 0, 0x228FE052, 0x03B882E8, 0xE2103E30],
+    'ST H7RS FS': [0x4000, 0x4F54411A, 0, 0x229ED522, 0x20081E8, 0x1610B230],
+    'ST U5A5/H7RS/N6 HS': [0x5000, 0x4F54411A, 0, 0x228FE052, 0x03B882E8, 0xE2103E30],
+    'XMC4500': [0xAEC000, 0x4F54292A, 0, 0x228F5930, 0x027A01E5, 0xDBF08030],
     'GD32VF103': [0x1000, 0, 0, 0, 0, 0],
-    'XMC4500': [0xAEC000, 0x4F54292A, 0, 0x228F5930, 0x027A01E5, 0xDBF08030]
-
 }
 
 # Combine dwc2_info with dwc2_reg_list
@@ -44,7 +50,7 @@ class GHWCFG2(ctypes.LittleEndianStructure):
     _fields_ = [
         ("op_mode", ctypes.c_uint32, 3),
         ("arch", ctypes.c_uint32, 2),
-        ("p2p (hub support)", ctypes.c_uint32, 1),
+        ("single_point", ctypes.c_uint32, 1),
         ("hs_phy_type", ctypes.c_uint32, 2),
         ("fs_phy_type", ctypes.c_uint32, 2),
         ("num_dev_ep", ctypes.c_uint32, 4),
@@ -119,6 +125,10 @@ GHWCFG2_field = {
         1: "DMA external",
         2: "DMA internal"
     },
+    'single_point': {
+        0: "hub",
+        1: "n/a"
+    },
     'hs_phy_type': {
         0: "n/a",
         1: "UTMI+",
@@ -130,7 +140,18 @@ GHWCFG2_field = {
         1: "Dedicated",
         2: "Shared UTMI+",
         3: "Shared ULPI"
-    }
+    },
+    'nptx_q_depth': {
+        0: "2",
+        1: "4",
+        2: "8",
+    },
+    'ptx_q_depth': {
+        0: "2",
+        1: "4",
+        2: "8",
+        3: "16"
+    },
 }
 
 # mapping for specific fields in GHWCFG4

@@ -1,1 +1,8 @@
-mcu:RP2040
+mcu:CH32F20X
+board:lpcxpresso54114
+mcu:FT90X
+board:atsaml21_xpro
+board:saml22_feather
+board:sensorwatch_m0
+# 64 KB flash: fits with GCC, not with clang since the dwc2 host split scheduler (skip.txt cannot name a toolchain)
+board:stm32h7s3nucleo

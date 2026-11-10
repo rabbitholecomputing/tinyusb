@@ -23,8 +23,8 @@
  *
  */
 
-#ifndef _TUSB_CONFIG_H_
-#define _TUSB_CONFIG_H_
+#ifndef TUSB_CONFIG_H_
+#define TUSB_CONFIG_H_
 
 // testing framework
 #include "unity.h"
@@ -78,7 +78,9 @@
 
 //------------- CLASS -------------//
 //#define CFG_TUD_CDC              0
+#ifndef CFG_TUD_MSC
 #define CFG_TUD_MSC              1
+#endif
 //#define CFG_TUD_HID              0
 //#define CFG_TUD_MIDI             0
 //#define CFG_TUD_VENDOR           0
@@ -99,8 +101,18 @@
 // Should be sufficient to hold ID (if any) + Data
 #define CFG_TUD_HID_EP_BUFSIZE    64
 
+//------------- MTP -------------//
+#define CFG_TUD_MTP_EP_BUFSIZE          512
+#define CFG_TUD_MTP_EP_CONTROL_BUFSIZE  16
+#define CFG_TUD_MTP_DEVICEINFO_EXTENSIONS                   "microsoft.com: 1.0; "
+#define CFG_TUD_MTP_DEVICEINFO_SUPPORTED_OPERATIONS         MTP_OP_GET_DEVICE_INFO, MTP_OP_OPEN_SESSION
+#define CFG_TUD_MTP_DEVICEINFO_SUPPORTED_EVENTS             MTP_EVENT_OBJECT_ADDED
+#define CFG_TUD_MTP_DEVICEINFO_SUPPORTED_DEVICE_PROPERTIES  MTP_DEV_PROP_DEVICE_FRIENDLY_NAME
+#define CFG_TUD_MTP_DEVICEINFO_CAPTURE_FORMATS              MTP_OBJ_FORMAT_UNDEFINED
+#define CFG_TUD_MTP_DEVICEINFO_PLAYBACK_FORMATS             MTP_OBJ_FORMAT_UNDEFINED
+
 #ifdef __cplusplus
  }
 #endif
 
-#endif /* _TUSB_CONFIG_H_ */
+#endif /* TUSB_CONFIG_H_ */

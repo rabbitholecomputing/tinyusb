@@ -53,9 +53,23 @@ void usb_device_task(void *param);
 void video_task(void* param);
 
 #if CFG_TUSB_OS == OPT_OS_FREERTOS
-void freertos_init_task(void);
+void freertos_init(void);
 #endif
 
+#if !defined(CFG_EXAMPLE_VIDEO_READONLY) || defined(CFG_EXAMPLE_VIDEO_BUFFERLESS)
+/* EBU color bars: https://stackoverflow.com/questions/6939422 */
+static uint8_t const bar_color[8][4] = {
+  /*  Y,   U,   Y,   V */
+  { 235, 128, 235, 128}, /* 100% White */
+  { 219,  16, 219, 138}, /* Yellow */
+  { 188, 154, 188,  16}, /* Cyan */
+  { 173,  42, 173,  26}, /* Green */
+  {  78, 214,  78, 230}, /* Magenta */
+  {  63, 102,  63, 240}, /* Red */
+  {  32, 240,  32, 118}, /* Blue */
+  {  16, 128,  16, 128}, /* Black */
+};
+#endif
 
 //--------------------------------------------------------------------+
 // Main
@@ -65,7 +79,7 @@ int main(void) {
 
   // If using FreeRTOS: create blinky, tinyusb device, video task
 #if CFG_TUSB_OS == OPT_OS_FREERTOS
-  freertos_init_task();
+  freertos_init();
 #else
   // init device stack on configured roothub port
   tusb_rhport_init_t dev_init = {
@@ -74,9 +88,7 @@ int main(void) {
   };
   tusb_init(BOARD_TUD_RHPORT, &dev_init);
 
-  if (board_init_after_tusb) {
-    board_init_after_tusb();
-  }
+  board_init_after_tusb();
 
   while (1) {
     tud_task(); // tinyusb device task
@@ -113,12 +125,55 @@ void tud_resume_cb(void) {
   blink_interval_ms = tud_mounted() ? BLINK_MOUNTED : BLINK_NOT_MOUNTED;
 }
 
+#ifdef CFG_EXAMPLE_VIDEO_BUFFERLESS
+
+#ifndef CFG_EXAMPLE_VIDEO_DISABLE_MJPEG
+  #error Demo only supports YUV2 please define CFG_EXAMPLE_VIDEO_DISABLE_MJPEG
+#endif
+
+void tud_video_prepare_payload_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx, tud_video_payload_request_t* request)
+{
+  static uint32_t frame_counter = 0;
+  (void)ctl_idx;
+  (void)stm_idx;
+
+  /* Offset will be zero at the start of a new frame */
+  if (!request->offset) frame_counter++;
+
+  for (size_t buf_pos = 0; buf_pos < request->length; buf_pos += 2) {
+
+    /* Position within the current line (pixel relative) */
+    int line_pos = ((request->offset + buf_pos)>>1) % FRAME_WIDTH;
+
+    /* Choose color based on the position and change the table offset every 4 frames */
+    const uint8_t* color = bar_color[(line_pos/(FRAME_WIDTH / 8) + (frame_counter>>2)) % 8];
+
+    /* Copy pixel data for odd or even pixels */
+    memcpy(&((uint8_t*)request->buf)[buf_pos], &color[(line_pos & 1) ? 2 : 0], 2);
+  }
+
+}
+#endif
+
 //--------------------------------------------------------------------+
 // USB Video
 //--------------------------------------------------------------------+
 static unsigned frame_num = 0;
 static unsigned tx_busy = 0;
+static unsigned tx_requeue = 0; // set by a resend: the next callback may be the old frame's
 static unsigned interval_ms = 1000 / FRAME_RATE;
+
+#if CFG_TUSB_OS == OPT_OS_FREERTOS
+// video_task and the frame callback in the usbd task test and change the frame state under this lock
+static SemaphoreHandle_t frame_mutex;
+  #define frame_lock()   ((void) xSemaphoreTake(frame_mutex, portMAX_DELAY))
+  #define frame_unlock() ((void) xSemaphoreGive(frame_mutex))
+#else
+  #define frame_lock()   ((void) 0)
+  #define frame_unlock() ((void) 0)
+#endif
+
+#ifndef CFG_EXAMPLE_VIDEO_BUFFERLESS
 
 #ifdef CFG_EXAMPLE_VIDEO_READONLY
 // For mcus that does not have enough SRAM for frame buffer, we use fixed frame data.
@@ -147,18 +202,6 @@ static struct {
 static uint8_t frame_buffer[FRAME_WIDTH * FRAME_HEIGHT * 16 / 8];
 
 static void fill_color_bar(uint8_t* buffer, unsigned start_position) {
-  /* EBU color bars: https://stackoverflow.com/questions/6939422 */
-  static uint8_t const bar_color[8][4] = {
-      /*  Y,   U,   Y,   V */
-      { 235, 128, 235, 128}, /* 100% White */
-      { 219,  16, 219, 138}, /* Yellow */
-      { 188, 154, 188,  16}, /* Cyan */
-      { 173,  42, 173,  26}, /* Green */
-      {  78, 214,  78, 230}, /* Magenta */
-      {  63, 102,  63, 240}, /* Red */
-      {  32, 240,  32, 118}, /* Blue */
-      {  16, 128,  16, 128}, /* Black */
-  };
   uint8_t* p;
 
   /* Generate the 1st line */
@@ -185,7 +228,33 @@ static void fill_color_bar(uint8_t* buffer, unsigned start_position) {
 
 #endif
 
-void video_send_frame(void) {
+#endif /* NDEF CFG_EXAMPLE_VIDEO_BUFFERLESS */
+
+static bool video_submit_frame(void) {
+#if defined(CFG_EXAMPLE_VIDEO_BUFFERLESS)
+  return tud_video_n_frame_xfer(0, 0, NULL, FRAME_WIDTH * FRAME_HEIGHT * 16 / 8);
+#elif defined (CFG_EXAMPLE_VIDEO_READONLY)
+  #if defined(CFG_EXAMPLE_VIDEO_DISABLE_MJPEG)
+  return tud_video_n_frame_xfer(0, 0, (void*)(uintptr_t)&frame_buffer[(frame_num % (FRAME_WIDTH / 2)) * 4],
+                                FRAME_WIDTH * FRAME_HEIGHT * 16/8);
+  #else
+  return tud_video_n_frame_xfer(0, 0, (void*)(uintptr_t)frames[frame_num % 8].buffer, frames[frame_num % 8].size);
+  #endif
+#else
+  return tud_video_n_frame_xfer(0, 0, (void*) frame_buffer, FRAME_WIDTH * FRAME_HEIGHT * 16 / 8);
+#endif
+}
+
+// Only with tx_busy clear: the driver owns no frame, so the buffer can be refilled
+static void video_send_new_frame(void) {
+#if !defined(CFG_EXAMPLE_VIDEO_BUFFERLESS) && !defined(CFG_EXAMPLE_VIDEO_READONLY)
+  fill_color_bar(frame_buffer, frame_num);
+#endif
+  tx_busy = video_submit_frame(); // a refused frame gets no callback (e.g. endpoint halted), retry at the next interval
+}
+
+// Called with frame_lock() held
+static void video_send_frame(void) {
   static unsigned start_ms = 0;
   static unsigned already_sent = 0;
 
@@ -197,38 +266,29 @@ void video_send_frame(void) {
 
   if (!already_sent) {
     already_sent = 1;
-    tx_busy = 1;
-    start_ms = board_millis();
-#ifdef CFG_EXAMPLE_VIDEO_READONLY
-    #if defined(CFG_EXAMPLE_VIDEO_DISABLE_MJPEG)
-    tud_video_n_frame_xfer(0, 0, (void*)(uintptr_t)&frame_buffer[(frame_num % (FRAME_WIDTH / 2)) * 4],
-                           FRAME_WIDTH * FRAME_HEIGHT * 16/8);
-    #else
-    tud_video_n_frame_xfer(0, 0, (void*)(uintptr_t)frames[frame_num % 8].buffer, frames[frame_num % 8].size);
-    #endif
-#else
-    fill_color_bar(frame_buffer, frame_num);
-    tud_video_n_frame_xfer(0, 0, (void*) frame_buffer, FRAME_WIDTH * FRAME_HEIGHT * 16 / 8);
-#endif
+    start_ms = tusb_time_millis_api();
+    if (tx_busy) {
+      // no callback yet: the driver still owns this buffer (PROBE) or dropped it (bus reset, SET_INTERFACE).
+      // Resend it unchanged; the old frame's callback may still be on its way, so the next one queues it again.
+      tx_requeue = 1;
+      (void) video_submit_frame();
+    } else {
+      video_send_new_frame();
+    }
   }
 
-  unsigned cur = board_millis();
-  if (cur - start_ms < interval_ms) return; // not enough time
-  if (tx_busy) return;
+  unsigned cur = tusb_time_millis_api();
+  if (cur - start_ms < interval_ms) {
+    return; // not enough time
+  }
+  if (tx_busy) {
+    if (tx_requeue) {
+      (void) video_submit_frame(); // a refused resend gets no callback, retry it
+    }
+    return;
+  }
   start_ms += interval_ms;
-  tx_busy = 1;
-
-#ifdef CFG_EXAMPLE_VIDEO_READONLY
-  #if defined(CFG_EXAMPLE_VIDEO_DISABLE_MJPEG)
-  tud_video_n_frame_xfer(0, 0, (void*)(uintptr_t)&frame_buffer[(frame_num % (FRAME_WIDTH / 2)) * 4],
-                         FRAME_WIDTH * FRAME_HEIGHT * 16/8);
-  #else
-  tud_video_n_frame_xfer(0, 0, (void*)(uintptr_t)frames[frame_num % 8].buffer, frames[frame_num % 8].size);
-  #endif
-#else
-  fill_color_bar(frame_buffer, frame_num);
-  tud_video_n_frame_xfer(0, 0, (void*) frame_buffer, FRAME_WIDTH * FRAME_HEIGHT * 16 / 8);
-#endif
+  video_send_new_frame();
 }
 
 
@@ -236,7 +296,9 @@ void video_task(void* param) {
   (void) param;
 
   while(1) {
+    frame_lock();
     video_send_frame();
+    frame_unlock();
 
     #if CFG_TUSB_OS == OPT_OS_FREERTOS
     vTaskDelay(interval_ms / portTICK_PERIOD_MS);
@@ -246,12 +308,32 @@ void video_task(void* param) {
   }
 }
 
+static void video_frame_released(bool delivered) {
+  frame_lock();
+  if (tx_requeue) {
+    // may be the old frame's late callback; queued here in the usbd task, only this frame's callback can follow
+    if (video_submit_frame()) {
+      tx_requeue = 0;
+    }
+  } else {
+    tx_busy = 0;
+    if (delivered) {
+      ++frame_num;
+    }
+  }
+  frame_unlock();
+}
+
 void tud_video_frame_xfer_complete_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx) {
   (void) ctl_idx;
   (void) stm_idx;
-  tx_busy = 0;
-  /* flip buffer */
-  ++frame_num;
+  video_frame_released(true);
+}
+
+void tud_video_frame_xfer_abort_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx) {
+  (void) ctl_idx;
+  (void) stm_idx;
+  video_frame_released(false);
 }
 
 int tud_video_commit_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx,
@@ -275,7 +357,9 @@ void led_blinking_task(void* param) {
     #if CFG_TUSB_OS == OPT_OS_FREERTOS
     vTaskDelay(blink_interval_ms / portTICK_PERIOD_MS);
     #else
-    if (board_millis() - start_ms < blink_interval_ms) return; // not enough time
+    if (tusb_time_millis_api() - start_ms < blink_interval_ms) {
+      return; // not enough time
+    }
     #endif
 
     start_ms += blink_interval_ms;
@@ -292,15 +376,15 @@ void led_blinking_task(void* param) {
 #define BLINKY_STACK_SIZE   configMINIMAL_STACK_SIZE
 #define VIDEO_STACK_SIZE    (configMINIMAL_STACK_SIZE*4)
 
-#if TUP_MCU_ESPRESSIF
+#ifdef ESP_PLATFORM
   #define USBD_STACK_SIZE     4096
   int main(void);
   void app_main(void) {
     main();
   }
 #else
-  // Increase stack size when debug log is enabled
-  #define USBD_STACK_SIZE    (3*configMINIMAL_STACK_SIZE/2) * (CFG_TUSB_DEBUG ? 2 : 1)
+  // Increase stack size when debug log or SYSVIEW instrumentation is enabled
+  #define USBD_STACK_SIZE    (3*configMINIMAL_STACK_SIZE/2) * (BOARD_STACK_INSTRUMENTED ? 2 : 1)
 #endif
 
 // static task
@@ -313,6 +397,8 @@ StaticTask_t usb_device_taskdef;
 
 StackType_t  video_stack[VIDEO_STACK_SIZE];
 StaticTask_t video_taskdef;
+
+StaticSemaphore_t frame_mutexdef;
 #endif
 
 // USB Device Driver task
@@ -329,9 +415,7 @@ void usb_device_task(void *param) {
   };
   tusb_init(BOARD_TUD_RHPORT, &dev_init);
 
-  if (board_init_after_tusb) {
-    board_init_after_tusb();
-  }
+  board_init_after_tusb();
 
   // RTOS forever loop
   while (1) {
@@ -340,19 +424,21 @@ void usb_device_task(void *param) {
   }
 }
 
-void freertos_init_task(void) {
+void freertos_init(void) {
   #if configSUPPORT_STATIC_ALLOCATION
+  frame_mutex = xSemaphoreCreateMutexStatic(&frame_mutexdef);
   xTaskCreateStatic(led_blinking_task, "blinky", BLINKY_STACK_SIZE, NULL, 1, blinky_stack, &blinky_taskdef);
   xTaskCreateStatic(usb_device_task, "usbd", USBD_STACK_SIZE, NULL, configMAX_PRIORITIES-1, usb_device_stack, &usb_device_taskdef);
   xTaskCreateStatic(video_task, "cdc", VIDEO_STACK_SIZE, NULL, configMAX_PRIORITIES - 2, video_stack, &video_taskdef);
   #else
+  frame_mutex = xSemaphoreCreateMutex();
   xTaskCreate(led_blinking_task, "blinky", BLINKY_STACK_SIZE, NULL, 1, NULL);
   xTaskCreate(usb_device_task, "usbd", USBD_STACK_SIZE, NULL, configMAX_PRIORITIES - 1, NULL);
-  xTaskCreate(video_task, "video", VIDEO_STACK_SZIE, NULL, configMAX_PRIORITIES - 2, NULL);
+  xTaskCreate(video_task, "video", VIDEO_STACK_SIZE, NULL, configMAX_PRIORITIES - 2, NULL);
   #endif
 
-  // skip starting scheduler (and return) for ESP32-S2 or ESP32-S3
-  #if !TUP_MCU_ESPRESSIF
+  // only start scheduler for non-espressif mcu
+  #ifndef ESP_PLATFORM
   vTaskStartScheduler();
   #endif
 }

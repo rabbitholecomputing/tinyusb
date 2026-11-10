@@ -1,4 +1,7 @@
-#include "TM4C123.h"
+/* metadata:
+   manufacturer: Texas Instruments
+*/
+
 #include "bsp/board_api.h"
 #include "board.h"
 
@@ -6,6 +9,8 @@
 // Forward USB interrupt events to TinyUSB IRQ Handler
 //--------------------------------------------------------------------+
 void USB0_Handler(void) {
+  // one SystemView span for both roles' self-wrapped handlers (tu_sysview_isr_enter)
+  TU_SYSVIEW_ISR_ENTER();
 #if CFG_TUH_ENABLED
   tuh_int_handler(0, true);
 #endif
@@ -13,6 +18,7 @@ void USB0_Handler(void) {
 #if CFG_TUD_ENABLED
   tud_int_handler(0);
 #endif
+  TU_SYSVIEW_ISR_EXIT();
 }
 
 //--------------------------------------------------------------------+
@@ -23,6 +29,9 @@ static void board_uart_init(void) {
   SYSCTL->RCGCUART |= (1 << 0);                // Enable the clock to UART0
   SYSCTL->RCGCGPIO |= (1 << 0);                // Enable the clock to GPIOA
 
+  while (!(SYSCTL->PRGPIO & (1 << 0))) {}      // Wait for the GPIOA clock to stabilize
+  while (!(SYSCTL->PRUART & (1 << 0))) {}      // Wait for the UART0 clock to stabilize
+
   GPIOA->AFSEL |= (1 << 1) | (1 << 0);         // Enable the alternate function on pin PA0 & PA1
   GPIOA->PCTL |= (1 << 0) | (1 << 4);          // Configure the GPIOPCTL register to select UART0 in PA0 and PA1
   GPIOA->DEN |= (1 << 0) | (1 << 1);           // Enable the digital functionality in PA0 and PA1
@@ -30,7 +39,7 @@ static void board_uart_init(void) {
   // BAUDRATE = 115200, with SystemCoreClock = 50 Mhz refer manual for calculation
   //  - BRDI = SystemCoreClock / (16* baud)
   //  - BRDF = int(fraction*64 + 0.5)
-  UART0->CTL &= ~(1 << 0);                     // Disable UART0 by clearing UARTEN bit in the UARTCTL register
+  UART0->CTL &= ~(1U << 0);                     // Disable UART0 by clearing UARTEN bit in the UARTCTL register
   UART0->IBRD = 27;                            // Write the integer portion of the BRD to the UARTIRD register
   UART0->FBRD = 8;                             // Write the fractional portion of the BRD to the UARTFBRD registerer
 
@@ -40,12 +49,34 @@ static void board_uart_init(void) {
   UART0->CTL = (1 << 0) | (1 << 8) | (1 << 9); // UART0 Enable, Transmit Enable, Receive Enable
 }
 
-static void initialize_board_led(GPIOA_Type* port, uint8_t PinMsk, uint8_t dirmsk) {
-  /* Enable PortF Clock */
-  SYSCTL->RCGCGPIO |= (1 << 5);
+static void board_button_init(GPIOA_Type* port, uint8_t PinMsk) {
+  /* Enable Port Clock */
+  SYSCTL->RCGCGPIO |= (1 << BTN_PORT_CLK);
 
   /* Let the clock stabilize */
-  while (!((SYSCTL->PRGPIO) & (1 << 5))) {}
+  while (!((SYSCTL->PRGPIO) & (1 << BTN_PORT_CLK))) {}
+
+  /* Port Digital Enable */
+  port->DEN |= PinMsk;
+
+  /* Set direction */
+  port->DIR &= ~PinMsk;
+
+  /* Enable internal pull so the idle state is deterministic. LaunchPad buttons
+   * connect the pin to GND when pressed (active-low) and require a pull-up. */
+#if BUTTON_STATE_ACTIVE == 0
+  port->PUR |= PinMsk;
+#else
+  port->PDR |= PinMsk;
+#endif
+}
+
+static void board_led_init(GPIOA_Type* port, uint8_t PinMsk, uint8_t dirmsk) {
+  /* Enable Port Clock */
+  SYSCTL->RCGCGPIO |= (1 << LED_PORT_CLK);
+
+  /* Let the clock stabilize */
+  while (!((SYSCTL->PRGPIO) & (1 << LED_PORT_CLK))) {}
 
   /* Port Digital Enable */
   port->DEN |= PinMsk;
@@ -67,16 +98,21 @@ static uint32_t ReadGPIOPin(GPIOA_Type* port, uint8_t pinMsk) {
 }
 
 void board_init(void) {
+#ifdef TM4C123_H
   SystemCoreClockUpdate();
+#endif
 
 #if CFG_TUSB_OS == OPT_OS_NONE
   // 1ms tick timer
   SysTick_Config(SystemCoreClock / 1000);
 #elif CFG_TUSB_OS == OPT_OS_FREERTOS
+  // Explicitly disable systick to prevent its ISR from running before scheduler start
+  SysTick->CTRL &= ~1U;
   // If freeRTOS is used, IRQ priority is limit by max syscall ( smaller is higher )
   NVIC_SetPriority(USB0_IRQn, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY );
 #endif
 
+#ifdef TM4C123_H
   /* Reset USB */
   SYSCTL->SRCR2 |= (1u << 16);
 
@@ -93,7 +129,7 @@ void board_init(void) {
   /* USB IO Initialization */
   SYSCTL->RCGCGPIO |= (1u << 3);
 
-  /* Let the clock stabilize */
+    /* Let the clock stabilize */
   while (!(SYSCTL->PRGPIO & (1u << 3))) {}
 
   /* USB IOs to Analog Mode */
@@ -101,16 +137,43 @@ void board_init(void) {
   GPIOD->DEN &= ~((1u << 4) | (1u << 5));
   GPIOD->AMSEL |= ((1u << 4) | (1u << 5));
 
-  uint8_t leds = (1 << LED_PIN_RED) | (1 << LED_PIN_BLUE) | (1 << LED_PIN_GREEN);
-  uint8_t dirmsk = (1 << LED_PIN_RED) | (1 << LED_PIN_BLUE) | (1 << LED_PIN_GREEN);
+#else // TM4C129
+  /* Reset USB */
+  SYSCTL->SRUSB = 1;
+
+  for (volatile uint8_t i = 0; i < 20; i++) {}
+
+  SYSCTL->SRUSB = 0;
+
+  /* Open the USB clock gate */
+  SYSCTL->RCGCUSB = 1;
+
+  /* Let the clock stabilize */
+  while(!(SYSCTL->PRUSB & 1)) {}
+
+  /* USB IO Initialization */
+  SYSCTL->RCGCGPIO |= (1u << 10);
+
+  /* Let the clock stabilize */
+  while (!(SYSCTL->PRGPIO & (1u << 10))) {}
+
+  /* USB IOs to Analog Mode */
+  GPIOL->AFSEL &= ~((1u << 6) | (1u << 7));
+  GPIOL->DEN &= ~((1u << 6) | (1u << 7));
+  GPIOL->AMSEL |= ((1u << 6) | (1u << 7));
+
+  /* USB Clock Configuration */
+  USB0->CC = 0x207;
+#endif
+
+  uint8_t leds = 1 << BOARD_LED_PIN;
+  uint8_t dirmsk = 1 << BOARD_LED_PIN;
+
+  /* Configure GPIO for board button */
+  board_button_init(BOARD_BTN_PORT, BOARD_BTN_Msk);
 
   /* Configure GPIO for board LED */
-  initialize_board_led(LED_PORT, leds, dirmsk);
-
-  /* Configure GPIO for board switch */
-  GPIOF->DIR &= ~(1 << BOARD_BTN);
-  GPIOF->PUR |= (1 << BOARD_BTN);
-  GPIOF->DEN |= (1 << BOARD_BTN);
+  board_led_init(LED_PORT, leds, dirmsk);
 
   /* Initialize board UART */
   board_uart_init();
@@ -119,7 +182,7 @@ void board_init(void) {
 }
 
 void board_led_write(bool state) {
-  WriteGPIOPin(LED_PORT, (1 << LED_PIN_BLUE), state);
+  WriteGPIOPin(LED_PORT, (1 << BOARD_LED_PIN), state);
 }
 
 uint32_t board_button_read(void) {
@@ -137,13 +200,16 @@ size_t board_get_unique_id(uint8_t id[], size_t max_len) {
 
 int board_uart_write(void const* buf, int len) {
   uint8_t const* data = buf;
-
-  for (int i = 0; i < len; i++) {
-    while ((UART0->FR & (1 << 5)) != 0) {} // Poll until previous data was shofted out
-    UART0->DR = data[i];                   // Write UART0 DATA REGISTER
+  int count = 0;
+  while (count < len) {
+    if ((UART0->FR & (1 << 5)) == 0) { // TX FIFO not full
+      UART0->DR = data[count];
+      count++;
+    } else {
+      break;
+    }
   }
-
-  return len;
+  return count;
 }
 
 int board_uart_read(uint8_t* buf, int len) {
@@ -159,7 +225,7 @@ void SysTick_Handler(void) {
   system_ticks++;
 }
 
-uint32_t board_millis(void) {
+uint32_t tusb_time_millis_api(void) {
   return system_ticks;
 }
 

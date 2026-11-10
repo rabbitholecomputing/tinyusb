@@ -24,6 +24,10 @@
  * This file is part of the TinyUSB stack.
  */
 
+/* metadata:
+   manufacturer: NXP
+*/
+
 #ifdef __GNUC__
   #pragma GCC diagnostic push
   #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -37,6 +41,10 @@
 
 #include "bsp/board_api.h"
 #include "board.h"
+
+extern void USB_IRQHandler(void);
+extern void SysTick_Handler(void);
+void SystemInit(void);
 
 //--------------------------------------------------------------------+
 // Forward USB interrupt events to TinyUSB IRQ Handler
@@ -66,6 +74,8 @@ void board_init(void) {
   // 1ms tick timer
   SysTick_Config(SystemCoreClock / 1000);
 #elif CFG_TUSB_OS == OPT_OS_FREERTOS
+  // Explicitly disable systick to prevent its ISR from running before scheduler start
+  SysTick->CTRL &= ~1U;
   // If freeRTOS is used, IRQ priority is limit by max syscall ( smaller is higher )
   NVIC_SetPriority(USB0_IRQn, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY );
 #endif
@@ -80,11 +90,29 @@ void board_init(void) {
 
   // USB: Setup PLL clock, and power
   Chip_USB_Init();
+
+#if CFG_TUSB_SYSVIEW_ENABLED
+  // Free-running 1 MHz timestamp source for SystemView, see SEGGER_SYSVIEW_X_GetTimestamp() below.
+  // CT32B0 is unused elsewhere in this BSP; SysTick is left alone since it backs the 1 ms tick.
+  Chip_Clock_EnablePeriphClock(SYSCTL_CLOCK_CT32B0);
+  LPC_TIMER32_0->TCR = TIMER_RESET;                      // hold TC/PC in reset while configuring
+  LPC_TIMER32_0->PR  = (SystemCoreClock / 1000000u) - 1; // PCLK is the system clock, TC ticks every PR+1
+  LPC_TIMER32_0->TCR = TIMER_ENABLE;                     // release reset and count, no match/capture configured
+#endif
 }
 
 //--------------------------------------------------------------------+
 // Board porting API
 //--------------------------------------------------------------------+
+#if CFG_TUSB_SYSVIEW_ENABLED
+// Cortex-M0 has no DWT cycle counter, so SystemView takes its timestamp from a hardware timer
+// (contract in src/tusb.c: free-running microseconds). CT32B0 is a genuinely 32-bit
+// counter prescaled to 1 MHz in board_init(), so its TC is already the required value and wraps
+// only every ~71 minutes.
+uint32_t SEGGER_SYSVIEW_X_GetTimestamp(void) {
+  return LPC_TIMER32_0->TC;
+}
+#endif
 
 void board_led_write(bool state) {
   Chip_GPIO_SetPinState(LPC_GPIO, LED_PORT, LED_PIN, state ? LED_STATE_ON : (1 - LED_STATE_ON));
@@ -104,13 +132,13 @@ uint32_t board_button_read(void) {
 int board_uart_read(uint8_t* buf, int len) {
   (void) buf;
   (void) len;
-  return 0;
+  return -1;
 }
 
 int board_uart_write(void const* buf, int len) {
   (void) buf;
   (void) len;
-  return 0;
+  return -1;
 }
 
 #if CFG_TUSB_OS == OPT_OS_NONE
@@ -120,7 +148,7 @@ void SysTick_Handler(void) {
   system_ticks++;
 }
 
-uint32_t board_millis(void) {
+uint32_t tusb_time_millis_api(void) {
   return system_ticks;
 }
 

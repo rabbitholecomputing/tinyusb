@@ -24,20 +24,19 @@
  * This file is part of the TinyUSB stack.
  */
 
+/* metadata:
+   manufacturer: Renesas
+*/
+
 #include <stdio.h>
 
 #ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-prototypes"
 #pragma GCC diagnostic ignored "-Wundef"
-
-// extra push due to https://github.com/renesas/fsp/pull/278
-#pragma GCC diagnostic push
 #endif
 
-#include "bsp_api.h"
-#include "r_ioport.h"
-#include "r_ioport_api.h"
+#include "common_data.h"
 #include "renesas.h"
 
 #ifdef __GNUC__
@@ -49,12 +48,6 @@
 
 /* Key code for writing PRCR register. */
 #define BSP_PRV_PRCR_KEY         (0xA500U)
-
-static const ioport_cfg_t family_pin_cfg = {
-    .number_of_pins = sizeof(board_pin_cfg) / sizeof(ioport_pin_cfg_t),
-    .p_pin_cfg_data = board_pin_cfg,
-};
-static ioport_instance_ctrl_t port_ctrl;
 
 //--------------------------------------------------------------------+
 // Vector Data
@@ -103,16 +96,49 @@ void board_init(void) {
   __enable_irq();
 
   /* Configure pins. */
-  R_IOPORT_Open(&port_ctrl, &family_pin_cfg);
+  R_IOPORT_Open(&IOPORT_CFG_CTRL, &IOPORT_CFG_NAME);
 
 #ifdef TRACE_ETM
-  // TRCKCR is protected by PRCR bit0 register
-  R_SYSTEM->PRCR = (uint16_t) (BSP_PRV_PRCR_KEY | 0x01);
+  // TRCKCR is only writable while a debugger is connected (RA HUM) - a
+  // standalone boot must skip trace init or the write wedges the chip into
+  // an un-attachable crash loop (recover: power-cycle + immediate erase)
+  if (DCB->DHCSR & DCB_DHCSR_C_DEBUGEN_Msk) {
+    // TRCKCR is protected by PRCR bit0 register
+    R_SYSTEM->PRCR = (uint16_t) (BSP_PRV_PRCR_KEY | 0x01);
 
-  // Enable trace clock (max 100Mhz). Since PLL/CPU is 200Mhz, clock div = 2
-  R_SYSTEM->TRCKCR = R_SYSTEM_TRCKCR_TRCKEN_Msk | 0x01;
+    // TCLK pin = TRCLK/2; set the divider with TRCKEN=0 first (HUM procedure).
+    // Values are the empirical per-board ceilings.
+#if defined(BSP_MCU_GROUP_RA8M1)
+    // 480 MHz CPU: /4 -> 120 MHz TRCLK, 60 MHz pin - chip max, clean on
+    // EK-RA8M1 with the committed empty-OnTraceStart JLinkScript (which
+    // defers the trace clock to firmware; without it the FSP MOCO->PLL
+    // switch steps the clock mid-stream and any divider fails)
+    R_SYSTEM->TRCKCR = 0x02;
+    R_SYSTEM->TRCKCR = R_SYSTEM_TRCKCR_TRCKEN_Msk | 0x02;
+#else
+    // RA6M5 200 MHz CPU: /4 -> 50 MHz TRCLK, 25 MHz pin. /2 (50 MHz pin) is
+    // silent on the EK-RA6M5 in every combination - board path ceiling,
+    // reconfirmed with J9 closed and the OnTraceStart override
+    R_SYSTEM->TRCKCR = 0x02;
+    R_SYSTEM->TRCKCR = R_SYSTEM_TRCKCR_TRCKEN_Msk | 0x02;
+#endif
 
-  R_SYSTEM->PRCR = (uint16_t) BSP_PRV_PRCR_KEY;
+    R_SYSTEM->PRCR = (uint16_t) BSP_PRV_PRCR_KEY;
+  }
+#endif
+
+#ifdef TRACE_SWO
+#ifndef BSP_MCU_GROUP_RA6M5
+  #error "TRACE_SWO: only RA6M5 is covered"
+#endif
+  // SWO on P109 (TDO/SWO, its reset function) needs the trace clock: TRCKEN, with TRCK kept as found. TRCKCR is
+  // writable only while a debugger is connected (DBGSTR.CDBGPWRUPREQ, RA6M5 HUM TRCKCR) and sits behind PRCR.PRC0;
+  // without a debugger the clock stays stopped, and a later capture starts it itself
+  if (R_DEBUG->DBGSTR & R_DEBUG_DBGSTR_CDBGPWRUPREQ_Msk) {
+    R_BSP_RegisterProtectDisable(BSP_REG_PROTECT_CGC);
+    R_SYSTEM->TRCKCR |= R_SYSTEM_TRCKCR_TRCKEN_Msk;
+    R_BSP_RegisterProtectEnable(BSP_REG_PROTECT_CGC);
+  }
 #endif
 
 #if CFG_TUSB_OS == OPT_OS_FREERTOS
@@ -125,6 +151,9 @@ void board_init(void) {
 
 #if CFG_TUSB_OS == OPT_OS_NONE
   SysTick_Config(SystemCoreClock / 1000);
+#elif CFG_TUSB_OS == OPT_OS_FREERTOS
+  // Explicitly disable systick to prevent its ISR from running before scheduler start
+  SysTick->CTRL &= ~1U;
 #endif
 
   board_led_write(false);
@@ -138,12 +167,12 @@ void board_init_after_tusb(void) {
 }
 
 void board_led_write(bool state) {
-  R_IOPORT_PinWrite(&port_ctrl, LED1, state ? LED_STATE_ON : !LED_STATE_ON);
+  R_IOPORT_PinWrite(&IOPORT_CFG_CTRL, LED1, state ? LED_STATE_ON : !LED_STATE_ON);
 }
 
 uint32_t board_button_read(void) {
   bsp_io_level_t lvl = !BUTTON_STATE_ACTIVE;
-  R_IOPORT_PinRead(&port_ctrl, SW1, &lvl);
+  R_IOPORT_PinRead(&IOPORT_CFG_CTRL, SW1, &lvl);
   return lvl == BUTTON_STATE_ACTIVE;
 }
 
@@ -157,13 +186,13 @@ size_t board_get_unique_id(uint8_t id[], size_t max_len) {
 int board_uart_read(uint8_t *buf, int len) {
   (void) buf;
   (void) len;
-  return 0;
+  return -1;
 }
 
 int board_uart_write(void const *buf, int len) {
   (void) buf;
   (void) len;
-  return 0;
+  return -1;
 }
 
 #if CFG_TUSB_OS == OPT_OS_NONE
@@ -173,7 +202,7 @@ void SysTick_Handler(void) {
   system_ticks++;
 }
 
-uint32_t board_millis(void) {
+uint32_t tusb_time_millis_api(void) {
   return system_ticks;
 }
 #endif
@@ -211,7 +240,6 @@ void usbfs_d1fifo_handler(void) {
 
 //------------- USB1 HighSpeed -------------//
 #ifdef BOARD_HAS_USB_HIGHSPEED
-
 void usbhs_interrupt_handler(void) {
   IRQn_Type irq = R_FSP_CurrentIrqGet();
   R_BSP_IrqStatusClear(irq);
@@ -230,7 +258,6 @@ void usbhs_d1fifo_handler(void) {
   R_BSP_IrqStatusClear(irq);
   // TODO not used yet
 }
-
 #endif
 
 //--------------------------------------------------------------------+

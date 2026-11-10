@@ -1,31 +1,12 @@
 /*
- * The MIT License (MIT)
- *
- * Copyright (c) 2022, Ha Thach (tinyusb.org)
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * SPDX-FileCopyrightText: Copyright (c) 2022, Ha Thach (tinyusb.org)
+ * SPDX-License-Identifier: MIT
  *
  * This file is part of the TinyUSB stack.
  */
 
-#ifndef _TUSB_DEBUG_H_
-#define _TUSB_DEBUG_H_
+#ifndef TUSB_DEBUG_H_
+#define TUSB_DEBUG_H_
 
 #ifdef __cplusplus
  extern "C" {
@@ -55,11 +36,14 @@ void tu_print_mem(void const *buf, uint32_t count, uint8_t indent);
   extern int CFG_TUSB_DEBUG_PRINTF(const char *format, ...);
   #define tu_printf    CFG_TUSB_DEBUG_PRINTF
 #else
-  #define tu_printf    printf
+  #include <stdio.h>
+  #define tu_printf(...)    (void) printf(__VA_ARGS__)
 #endif
 
-static inline void tu_print_buf(uint8_t const* buf, uint32_t bufsize) {
-  for(uint32_t i=0; i<bufsize; i++) tu_printf("%02X ", buf[i]);
+TU_ATTR_ALWAYS_INLINE static inline void tu_print_buf(uint8_t const* buf, uint32_t bufsize) {
+  for(uint32_t i=0; i<bufsize; i++) {
+    tu_printf("%02X ", buf[i]);
+  }
   tu_printf("\r\n");
 }
 
@@ -108,16 +92,22 @@ typedef struct {
 } tu_lookup_table_t;
 
 static inline const char* tu_lookup_find(tu_lookup_table_t const* p_table, uint32_t key) {
-  tu_static char not_found[11];
-
   for(uint16_t i=0; i<p_table->count; i++) {
-    if (p_table->items[i].key == key) return p_table->items[i].data;
+    if (p_table->items[i].key == key) {
+      return p_table->items[i].data;
+    }
   }
 
-  // not found return the key value in hex
-  snprintf(not_found, sizeof(not_found), "0x%08lX", (unsigned long) key);
-
+  #ifndef CFG_TUSB_DEBUG_PRINTF
+  // not found return the key value in hex if no custom printf is defined
+  static char not_found[11];
+  if (snprintf(not_found, sizeof(not_found), "0x%08lX", (unsigned long)key) <= 0) {
+    not_found[0] = 0;
+  }
   return not_found;
+  #else
+  return "NotFound";
+  #endif
 }
 
 #endif // CFG_TUSB_DEBUG
@@ -131,8 +121,6 @@ static inline const char* tu_lookup_find(tu_lookup_table_t const* p_table, uint3
   #define TU_LOG_LOCATION()
   #define TU_LOG_FAILED()
 #endif
-
-// TODO replace all TU_LOGn with TU_LOG(n)
 
 #define TU_LOG0(...)
 #define TU_LOG0_MEM(...)
@@ -164,8 +152,125 @@ static inline const char* tu_lookup_find(tu_lookup_table_t const* p_table, uint3
   #define TU_LOG3_HEX(...)
 #endif
 
+//--------------------------------------------------------------------+
+// SystemView
+//--------------------------------------------------------------------+
+
+// Category levels — overridable, must expand to a literal 1..4. Defined
+// unconditionally (not gated on CFG_TUSB_SYSVIEW_ENABLED) so usbd.h/usbh.h can
+// compare CFG_TUSB_SYSVIEW against them even when SYSVIEW is fully disabled; an
+// undefined macro reads as 0 in #if, which would make
+// "CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_ISR" true (0 >= 0) instead of
+// false when the level macro is otherwise unavailable.
+#ifndef CFG_TUSB_SYSVIEW_LEVEL_ISR
+  #define CFG_TUSB_SYSVIEW_LEVEL_ISR    1   // USB interrupt enter/exit
+#endif
+#ifndef CFG_TUSB_SYSVIEW_LEVEL_USB
+  #define CFG_TUSB_SYSVIEW_LEVEL_USB    2   // usbd/usbh core functions
+#endif
+#ifndef CFG_TUSB_SYSVIEW_LEVEL_PORT
+  #define CFG_TUSB_SYSVIEW_LEVEL_PORT   3   // dcd/hcd API (wrapped at usbd/usbh call sites)
+#endif
+#ifndef CFG_TUSB_SYSVIEW_LEVEL_CLASS
+  #define CFG_TUSB_SYSVIEW_LEVEL_CLASS  4   // class driver API
+#endif
+
+// a role's ISR spans are recorded only when its stack is enabled and its level reaches ISR
+#define TUD_SYSVIEW_ISR_TRACED (CFG_TUD_ENABLED && CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_ISR)
+#define TUH_SYSVIEW_ISR_TRACED (CFG_TUH_ENABLED && CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_ISR)
+
+#if CFG_TUSB_SYSVIEW_ENABLED
+// SEGGER.h defines INLINE (under #ifndef) and leaves it defined; nothing here uses it, but a
+// vendor SDK header included later in the same TU (lpcopen's lpc_types.h, unconditional
+// #define INLINE inline) redefines it and fails -Werror. Drop only the copy SEGGER.h added --
+// an INLINE the SDK defined earlier is the SDK's to keep.
+#ifdef INLINE
+  #define TU_SV_INLINE_PREDEFINED
+#endif
+#include "SEGGER_SYSVIEW.h"
+#ifndef TU_SV_INLINE_PREDEFINED
+  #undef INLINE
+#endif
+
+// Function-timing event ids, recorded as TU_SV_EVENT_BASE + id (see below). The order is fixed:
+// test/hil/helper/sysview_events.json names them host-side (agentrc's sysview_report.py --event-map).
+typedef enum {
+  TU_SV_ID_TUD_TASK = 0,   // one usbd event processed        (level USB)
+  TU_SV_ID_USBD_XFER,      // usbd_edpt_xfer                  (level USB)
+  TU_SV_ID_DCD_XFER,       // dcd_edpt_xfer call               (level PORT)
+  TU_SV_ID_CDC_FLUSH,      // tud_cdc_n_write_flush           (level CLASS)
+  TU_SV_ID_CDC_READ,       // tud_cdc_n_read                  (level CLASS)
+  TU_SV_ID_MSC_XFER,       // mscd_xfer_cb                    (level CLASS)
+  TU_SV_ID_TUH_TASK,       // one usbh event processed        (level USB)
+  TU_SV_ID_HCD_XFER,       // hcd_edpt_xfer call               (level PORT)
+  TU_SV_ID_COUNT
+} tu_sysview_id_t;
+
+void tu_sysview_init(void);
+
+// True on every 1024th call for a role; each role counts its own processed events
+bool tu_sysview_stack_report_due(tusb_role_t role);
+
+// Called once per processed usbd/usbh event: a due role reports one task's stack (FreeRTOS, level USB and up)
+#if CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_USB && CFG_TUSB_OS == OPT_OS_FREERTOS
+void tu_sysview_stack_report(tusb_role_t role);
+#else
+#define tu_sysview_stack_report(_role)
+#endif
+
+// Give a kernel object (mutex, semaphore) a name in SystemView, so a blocked task reads
+// "waiting on usbd_mutex" instead of a bare address. Sent now and kept for the system description
+// a later recorder connect replays.
+void tu_sysview_name_resource(const void* handle, const char* name);
+
+// CPU clock reported to SystemView. Weak default returns the CMSIS SystemCoreClock; BSPs whose
+// SDK has no such global (e.g. rp2040's Pico SDK) override it in hw/bsp/<family>/family.c.
+uint32_t tusb_sysview_cpu_freq(void);
+
+// Rate of SEGGER_SYSVIEW_GET_TIMESTAMP(). Weak default is the CPU clock for the DWT cycle counter on a CM3-class
+// core, else 1 MHz; a BSP whose timestamp timer runs at another rate overrides it.
+uint32_t SEGGER_SYSVIEW_X_GetTimestampFreq(void);
+
+// Fixed event base instead of a registered SEGGER_SYSVIEW_MODULE: SystemView 4.10b on Linux greys
+// out Save Recording / Export Data once any module is registered. 512 is MODULE_EVENT_OFFSET, the
+// id SEGGER_SYSVIEW_RegisterModule() would give the first module.
+#define TU_SV_EVENT_BASE 512
+
+// _level is one of the CFG_TUSB_SYSVIEW_LEVEL_* constants, so a site above the configured level
+// compiles to nothing
+#define _TU_SV_RECORD(_id) SEGGER_SYSVIEW_RecordVoid(TU_SV_EVENT_BASE + (_id))
+#define _TU_SV_END(_id)    SEGGER_SYSVIEW_RecordEndCall(TU_SV_EVENT_BASE + (_id))
+
+#define TU_SYSVIEW_CALL(_level, _id) do { if (CFG_TUSB_SYSVIEW >= (_level)) { _TU_SV_RECORD(_id); } } while (0)
+#define TU_SYSVIEW_RET(_level, _id)  do { if (CFG_TUSB_SYSVIEW >= (_level)) { _TU_SV_END(_id); } } while (0)
+
+// ISR wrap for the shared tusb_int_handler entry, through tusb.c's depth counter
+// (tu_sysview_isr_enter() has why): a dual-role BSP's nested tud_/tuh_int_handler() wraps
+// record one span.
+#if CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_ISR
+  void tu_sysview_isr_enter(void);
+  void tu_sysview_isr_exit(void);
+  #define TU_SYSVIEW_ISR_ENTER() tu_sysview_isr_enter()
+  #define TU_SYSVIEW_ISR_EXIT()  tu_sysview_isr_exit()
+#else
+  #define TU_SYSVIEW_ISR_ENTER()
+  #define TU_SYSVIEW_ISR_EXIT()
+#endif
+
+#else // !CFG_TUSB_SYSVIEW_ENABLED
+
+#define TU_SYSVIEW_ISR_ENTER()
+#define TU_SYSVIEW_ISR_EXIT()
+#define TU_SYSVIEW_CALL(_level, _id)
+#define TU_SYSVIEW_RET(_level, _id)
+#define tu_sysview_init()
+#define tu_sysview_stack_report(_role)
+#define tu_sysview_name_resource(_handle, _name)
+
+#endif // CFG_TUSB_SYSVIEW_ENABLED
+
 #ifdef __cplusplus
  }
 #endif
 
-#endif /* _TUSB_DEBUG_H_ */
+#endif

@@ -24,20 +24,18 @@
  * This file is part of the TinyUSB stack.
  */
 
+/* metadata:
+   manufacturer: Espressif
+*/
+
 #include "bsp/board_api.h"
 #include "board.h"
 
 #include "esp_rom_gpio.h"
 #include "esp_mac.h"
-#include "hal/gpio_ll.h"
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
-#include "esp_private/periph_ctrl.h"
-
-// Note; current code use UART0 can cause device to reset while monitoring
-#define USE_UART  0
-#define UART_ID  UART_NUM_0
 
 #ifdef NEOPIXEL_PIN
 #include "led_strip.h"
@@ -49,7 +47,9 @@ static led_strip_handle_t led_strip;
 static void max3421_init(void);
 #endif
 
-static bool usb_init(void);
+#if TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3, OPT_MCU_ESP32H4, OPT_MCU_ESP32P4, OPT_MCU_ESP32S31)
+static bool usb_init(uint8_t rhport, bool is_host);
+#endif
 
 //--------------------------------------------------------------------+
 // Implementation
@@ -57,19 +57,6 @@ static bool usb_init(void);
 
 // Initialize on-board peripherals : led, button, uart and USB
 void board_init(void) {
-#if USE_UART
-  // uart init
-  uart_config_t uart_config = {
-      .baud_rate = 115200,
-      .data_bits = UART_DATA_8_BITS,
-      .parity = UART_PARITY_DISABLE,
-      .stop_bits = UART_STOP_BITS_1,
-      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-  };
-  uart_driver_install(UART_ID, 1024, 0, 0, NULL, 0);
-  uart_param_config(UART_ID, &uart_config);
-#endif
-
 #ifdef NEOPIXEL_PIN
   #ifdef NEOPIXEL_POWER_PIN
   gpio_reset_pin(NEOPIXEL_POWER_PIN);
@@ -101,8 +88,20 @@ void board_init(void) {
   gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
   gpio_set_pull_mode(BUTTON_PIN, BUTTON_STATE_ACTIVE ? GPIO_PULLDOWN_ONLY : GPIO_PULLUP_ONLY);
 
-#if TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3, OPT_MCU_ESP32P4)
-  usb_init();
+#if CONFIG_SOC_USB_OTG_SUPPORTED
+  #if CFG_TUD_ENABLED
+  usb_init(BOARD_TUD_RHPORT, false);
+  #endif
+
+  #if CFG_TUH_ENABLED
+  usb_init(BOARD_TUH_RHPORT, true);
+  #endif
+#endif
+
+#ifdef HIL_TS3USB30_MODE_PIN
+  gpio_reset_pin(HIL_TS3USB30_MODE_PIN);
+  gpio_set_direction(HIL_TS3USB30_MODE_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(HIL_TS3USB30_MODE_PIN, CFG_TUD_ENABLED ? HIL_TS3USB30_MODE_DEVICE : (1-HIL_TS3USB30_MODE_DEVICE));
 #endif
 
 #if CFG_TUH_ENABLED && CFG_TUH_MAX3421
@@ -110,17 +109,14 @@ void board_init(void) {
 #endif
 }
 
-#if TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3)
-
-#endif
-
 //--------------------------------------------------------------------+
 // Board porting API
 //--------------------------------------------------------------------+
 
 size_t board_get_unique_id(uint8_t id[], size_t max_len) {
-  // use factory default MAC as serial ID
-  esp_efuse_mac_get_default(id);
+  // factory MAC-48: esp_efuse_mac_get_default() is an 8-byte EUI-64 on 802.15.4 targets
+  (void) max_len;
+  TU_ASSERT(esp_read_mac(id, ESP_MAC_EFUSE_FACTORY) == ESP_OK, 0);
   return 6;
 }
 
@@ -139,104 +135,78 @@ uint32_t board_button_read(void) {
 
 // Get characters from UART
 int board_uart_read(uint8_t* buf, int len) {
-#if USE_UART
-  return uart_read_bytes(UART_ID, buf, len, 0);
-#else
-  return -1;
-#endif
+  for (int i=0; i<len; i++) {
+    int c = getchar();
+    if (c == EOF) {
+      return i;
+    }
+    buf[i] = (uint8_t) c;
+  }
+  return len;
 }
 
 // Send characters to UART
 int board_uart_write(void const* buf, int len) {
-  (void) buf;
-  (void) len;
-  return 0;
+  for (int i = 0; i < len; i++) {
+    putchar(((char*) buf)[i]);
+  }
+  return len;
 }
 
 int board_getchar(void) {
-  uint8_t c = 0;
-  return board_uart_read(&c, 1) > 0 ? (int) c : (-1);
+  return getchar();
+}
+
+int board_putchar(int c) {
+  return putchar(c);
+}
+
+void board_init_after_tusb(void) {
+  // nothing to do
+}
+
+void board_reset_to_bootloader(void) {
+  // not implemented
 }
 
 //--------------------------------------------------------------------
 // PHY Init
 //--------------------------------------------------------------------
 
-#if TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3, OPT_MCU_ESP32P4)
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+#if TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3, OPT_MCU_ESP32H4, OPT_MCU_ESP32P4, OPT_MCU_ESP32S31)
 
 #include "esp_private/usb_phy.h"
-#include "soc/usb_pins.h"
 
 static usb_phy_handle_t phy_hdl;
 
-bool usb_init(void) {
+bool usb_init(uint8_t rhport, bool is_host) {
+  (void) rhport;
   // Configure USB PHY
   usb_phy_config_t phy_conf = {
     .controller = USB_PHY_CTRL_OTG,
-    .target = USB_PHY_TARGET_INT,
-    .otg_mode = USB_OTG_MODE_DEVICE,
-  };
-
-  // OTG IOs config
-  // const usb_phy_otg_io_conf_t otg_io_conf = USB_PHY_SELF_POWERED_DEVICE(config->vbus_monitor_io);
-  // if (config->self_powered) {
-  //   phy_conf.otg_io_conf = &otg_io_conf;
-  // }
-  // ESP_RETURN_ON_ERROR(usb_new_phy(&phy_conf, &phy_hdl), TAG, "Install USB PHY failed");
-
-  usb_new_phy(&phy_conf, &phy_hdl);
-
-  return true;
-}
-
+#if defined(CONFIG_SOC_USB_UTMI_PHY_NUM) && CONFIG_SOC_USB_UTMI_PHY_NUM > 0
+    .target = USB_PHY_TARGET_UTMI,
 #else
+    .target = USB_PHY_TARGET_INT,
+#endif
 
-#include "esp_private/usb_phy.h"
-#include "hal/usb_hal.h"
-#include "soc/usb_periph.h"
-
-static void configure_pins(usb_hal_context_t* usb) {
-  /* usb_periph_iopins currently configures USB_OTG as USB Device.
-   * Introduce additional parameters in usb_hal_context_t when adding support
-   * for USB Host. */
-  for (const usb_iopin_dsc_t* iopin = usb_periph_iopins; iopin->pin != -1; ++iopin) {
-    if ((usb->use_external_phy) || (iopin->ext_phy_only == 0)) {
-      esp_rom_gpio_pad_select_gpio(iopin->pin);
-      if (iopin->is_output) {
-        esp_rom_gpio_connect_out_signal(iopin->pin, iopin->func, false, false);
-      } else {
-        esp_rom_gpio_connect_in_signal(iopin->pin, iopin->func, false);
-        if ((iopin->pin != GPIO_MATRIX_CONST_ZERO_INPUT) && (iopin->pin != GPIO_MATRIX_CONST_ONE_INPUT)) {
-          gpio_ll_input_enable(&GPIO, iopin->pin);
-        }
-      }
-      esp_rom_gpio_pad_unhold(iopin->pin);
-    }
-  }
-
-  if (!usb->use_external_phy) {
-    gpio_set_drive_capability(USBPHY_DM_NUM, GPIO_DRIVE_CAP_3);
-    gpio_set_drive_capability(USBPHY_DP_NUM, GPIO_DRIVE_CAP_3);
-  }
-}
-
-bool usb_init(void) {
-  // USB Controller Hal init
-  periph_module_reset(PERIPH_USB_MODULE);
-  periph_module_enable(PERIPH_USB_MODULE);
-
-  usb_hal_context_t hal = {
-    .use_external_phy = false // use built-in PHY
+    // maybe we can use USB_OTG_MODE_DEFAULT and switch using dwc2 driver
+    .otg_mode = is_host ? USB_OTG_MODE_HOST : USB_OTG_MODE_DEVICE,
+    // https://github.com/hathach/tinyusb/issues/2943#issuecomment-2601888322
+    // Set speed to undefined (auto-detect) to avoid timinng/racing issue with S3 with host such as macOS
+    .otg_speed = USB_PHY_SPEED_UNDEFINED,
   };
 
-  usb_hal_init(&hal);
-  configure_pins(&hal);
+  esp_err_t const err = usb_new_phy(&phy_conf, &phy_hdl);
+  if (err != ESP_OK) {
+    printf("usb_new_phy failed: %s\r\n", esp_err_to_name(err));
+    phy_hdl = NULL;
+    return false;
+  }
 
   return true;
 }
 
-#endif
 #endif
 
 //--------------------------------------------------------------------+
@@ -340,5 +310,4 @@ bool tuh_max3421_spi_xfer_api(uint8_t rhport, uint8_t const* tx_buf, uint8_t* rx
   ESP_ERROR_CHECK(spi_device_transmit(max3421_spi, &xact));
   return true;
 }
-
 #endif

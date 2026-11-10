@@ -1,25 +1,6 @@
 /*
- * The MIT License (MIT)
- *
- * Copyright (c) 2019 Ha Thach (tinyusb.org)
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * SPDX-FileCopyrightText: Copyright (c) 2019 Ha Thach (tinyusb.org)
+ * SPDX-License-Identifier: MIT
  *
  * This file is part of the TinyUSB stack.
  */
@@ -39,14 +20,48 @@
 #include "host/usbh_pvt.h"
 #endif
 
-#define TUP_USBIP_CONTROLLER_NUM 2
+// Suppress IAR warning
+// Warning[Pe111]: statement is unreachable
+#if defined(__ICCARM__)
+#pragma diag_suppress = Pe111
+#endif
 
-static tusb_role_t _rhport_role[TUP_USBIP_CONTROLLER_NUM] = { 0 };
+tusb_role_t _tusb_rhport_role[TUP_USBIP_CONTROLLER_NUM] = { TUSB_ROLE_INVALID };
+
+//--------------------------------------------------------------------
+// Weak/Default API, can be overwritten by Application
+//--------------------------------------------------------------------
+
+#if CFG_TUSB_OS != OPT_OS_NONE
+TU_ATTR_WEAK uint32_t tusb_time_millis_api(void) {
+  return osal_time_millis();
+}
+
+TU_ATTR_WEAK void tusb_time_delay_ms_api(uint32_t ms) {
+  osal_task_delay(ms);
+}
+
+#else
+// tusb_time_millis_api() must be implemented by user application.
+
+TU_ATTR_WEAK void tusb_time_delay_ms_api(uint32_t ms) {
+  // delay using millis()
+  const uint32_t time_ms = tusb_time_millis_api();
+  while ((tusb_time_millis_api() - time_ms) < ms) {}
+}
+#endif
+
+TU_ATTR_WEAK void *tusb_app_virt_to_phys(void *virt_addr) {
+  return virt_addr;
+}
+
+TU_ATTR_WEAK void* tusb_app_phys_to_virt(void *phys_addr) {
+  return phys_addr;
+}
 
 //--------------------------------------------------------------------+
 // Public API
 //--------------------------------------------------------------------+
-
 bool tusb_rhport_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   //  backward compatible called with tusb_init(void)
   #if defined(TUD_OPT_RHPORT) || defined(TUH_OPT_RHPORT)
@@ -57,8 +72,8 @@ bool tusb_rhport_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
       .role = TUSB_ROLE_DEVICE,
       .speed = TUD_OPT_HIGH_SPEED ? TUSB_SPEED_HIGH : TUSB_SPEED_FULL
     };
-    TU_ASSERT ( tud_rhport_init(rhport, &dev_init) );
-    _rhport_role[TUD_OPT_RHPORT] = TUSB_ROLE_DEVICE;
+    TU_ASSERT ( tud_rhport_init(TUD_OPT_RHPORT, &dev_init) );
+    _tusb_rhport_role[TUD_OPT_RHPORT] = TUSB_ROLE_DEVICE;
     #endif
 
     #if CFG_TUH_ENABLED && defined(TUH_OPT_RHPORT)
@@ -68,7 +83,7 @@ bool tusb_rhport_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
       .speed = TUH_OPT_HIGH_SPEED ? TUSB_SPEED_HIGH : TUSB_SPEED_FULL
     };
     TU_ASSERT( tuh_rhport_init(TUH_OPT_RHPORT, &host_init) );
-    _rhport_role[TUH_OPT_RHPORT] = TUSB_ROLE_HOST;
+    _tusb_rhport_role[TUH_OPT_RHPORT] = TUSB_ROLE_HOST;
     #endif
 
     return true;
@@ -77,6 +92,7 @@ bool tusb_rhport_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
 
   // new API with explicit rhport and role
   TU_ASSERT(rhport < TUP_USBIP_CONTROLLER_NUM && rh_init->role != TUSB_ROLE_INVALID);
+  _tusb_rhport_role[rhport] = rh_init->role;
 
   #if CFG_TUD_ENABLED
   if (rh_init->role == TUSB_ROLE_DEVICE) {
@@ -90,7 +106,6 @@ bool tusb_rhport_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   }
   #endif
 
-  _rhport_role[rhport] = rh_init->role;
   return true;
 }
 
@@ -98,11 +113,15 @@ bool tusb_inited(void) {
   bool ret = false;
 
   #if CFG_TUD_ENABLED
-  ret = ret || tud_inited();
+  if (tud_inited()) {
+    ret = true;
+  }
   #endif
 
   #if CFG_TUH_ENABLED
-  ret = ret || tuh_inited();
+  if (tuh_inited()) {
+    ret = true;
+  }
   #endif
 
   return ret;
@@ -110,19 +129,46 @@ bool tusb_inited(void) {
 
 void tusb_int_handler(uint8_t rhport, bool in_isr) {
   TU_VERIFY(rhport < TUP_USBIP_CONTROLLER_NUM,);
+  // ports may call this from task context (in_isr false): no span here then (a port's ISR body may record its own)
+  if (in_isr) { TU_SYSVIEW_ISR_ENTER(); }
 
   #if CFG_TUD_ENABLED
-  if (_rhport_role[rhport] == TUSB_ROLE_DEVICE) {
+  if (_tusb_rhport_role[rhport] == TUSB_ROLE_DEVICE) {
     (void) in_isr;
     dcd_int_handler(rhport);
   }
   #endif
 
   #if CFG_TUH_ENABLED
-  if (_rhport_role[rhport] == TUSB_ROLE_HOST) {
+  if (_tusb_rhport_role[rhport] == TUSB_ROLE_HOST) {
     hcd_int_handler(rhport, in_isr);
   }
   #endif
+
+  if (in_isr) { TU_SYSVIEW_ISR_EXIT(); }
+}
+
+bool tusb_deinit(uint8_t rhport) {
+  TU_VERIFY(rhport < TUP_USBIP_CONTROLLER_NUM);
+  bool ret = false;
+
+  #if CFG_TUD_ENABLED
+  if (_tusb_rhport_role[rhport] == TUSB_ROLE_DEVICE) {
+    TU_ASSERT(tud_deinit(rhport));
+    _tusb_rhport_role[rhport] = TUSB_ROLE_INVALID;
+    ret = true;
+  }
+  #endif
+
+  #if CFG_TUH_ENABLED
+  if (_tusb_rhport_role[rhport] == TUSB_ROLE_HOST) {
+    TU_ASSERT(tuh_deinit(rhport));
+    _tusb_rhport_role[rhport] = TUSB_ROLE_INVALID;
+    ret = true;
+  }
+  #endif
+
+  return ret;
 }
 
 //--------------------------------------------------------------------+
@@ -131,7 +177,9 @@ void tusb_int_handler(uint8_t rhport, bool in_isr) {
 
 uint8_t const* tu_desc_find(uint8_t const* desc, uint8_t const* end, uint8_t byte1) {
   while (desc + 1 < end) {
-    if (desc[1] == byte1) return desc;
+    if (desc[1] == byte1) {
+      return desc;
+    }
     desc += desc[DESC_OFFSET_LEN];
   }
   return NULL;
@@ -139,7 +187,9 @@ uint8_t const* tu_desc_find(uint8_t const* desc, uint8_t const* end, uint8_t byt
 
 uint8_t const* tu_desc_find2(uint8_t const* desc, uint8_t const* end, uint8_t byte1, uint8_t byte2) {
   while (desc + 2 < end) {
-    if (desc[1] == byte1 && desc[2] == byte2) return desc;
+    if (desc[1] == byte1 && desc[2] == byte2) {
+      return desc;
+    }
     desc += desc[DESC_OFFSET_LEN];
   }
   return NULL;
@@ -147,7 +197,9 @@ uint8_t const* tu_desc_find2(uint8_t const* desc, uint8_t const* end, uint8_t by
 
 uint8_t const* tu_desc_find3(uint8_t const* desc, uint8_t const* end, uint8_t byte1, uint8_t byte2, uint8_t byte3) {
   while (desc + 3 < end) {
-    if (desc[1] == byte1 && desc[2] == byte2 && desc[3] == byte3) return desc;
+    if (desc[1] == byte1 && desc[2] == byte2 && desc[3] == byte3) {
+      return desc;
+    }
     desc += desc[DESC_OFFSET_LEN];
   }
   return NULL;
@@ -157,44 +209,46 @@ uint8_t const* tu_desc_find3(uint8_t const* desc, uint8_t const* end, uint8_t by
 // Endpoint Helper for both Host and Device stack
 //--------------------------------------------------------------------+
 
-bool tu_edpt_claim(tu_edpt_state_t* ep_state, osal_mutex_t mutex) {
+bool tu_edpt_claim(volatile uint8_t* ep_state, osal_mutex_t mutex) {
   (void) mutex;
 
   // pre-check to help reducing mutex lock
-  TU_VERIFY((ep_state->busy == 0) && (ep_state->claimed == 0));
+  TU_VERIFY((*ep_state & (TU_EDPT_STATE_BUSY | TU_EDPT_STATE_CLAIMED | TU_EDPT_STATE_RX_PENDING)) == 0);
   (void) osal_mutex_lock(mutex, OSAL_TIMEOUT_WAIT_FOREVER);
 
-  // can only claim the endpoint if it is not busy and not claimed yet.
-  bool const available = (ep_state->busy == 0) && (ep_state->claimed == 0);
+  // can only claim the endpoint if it is not busy, not claimed yet and its received data is consumed.
+  bool const available = (*ep_state & (TU_EDPT_STATE_BUSY | TU_EDPT_STATE_CLAIMED | TU_EDPT_STATE_RX_PENDING)) == 0;
   if (available) {
-    ep_state->claimed = 1;
+    *ep_state |= TU_EDPT_STATE_CLAIMED;
   }
 
   (void) osal_mutex_unlock(mutex);
   return available;
 }
 
-bool tu_edpt_release(tu_edpt_state_t* ep_state, osal_mutex_t mutex) {
+bool tu_edpt_release(volatile uint8_t* ep_state, osal_mutex_t mutex) {
   (void) mutex;
   (void) osal_mutex_lock(mutex, OSAL_TIMEOUT_WAIT_FOREVER);
 
   // can only release the endpoint if it is claimed and not busy
-  bool const ret = (ep_state->claimed == 1) && (ep_state->busy == 0);
+  bool const ret = (*ep_state & (TU_EDPT_STATE_CLAIMED | TU_EDPT_STATE_BUSY)) == TU_EDPT_STATE_CLAIMED;
   if (ret) {
-    ep_state->claimed = 0;
+    *ep_state &= (uint8_t) ~TU_EDPT_STATE_CLAIMED;
   }
 
   (void) osal_mutex_unlock(mutex);
   return ret;
 }
 
-bool tu_edpt_validate(tusb_desc_endpoint_t const* desc_ep, tusb_speed_t speed) {
-  uint16_t const max_packet_size = tu_edpt_packet_size(desc_ep);
+#if CFG_TUSB_DEBUG
+bool tu_edpt_validate(const tusb_desc_endpoint_t *desc_ep, tusb_speed_t speed) {
+  const uint16_t max_packet_size = tu_edpt_packet_size(desc_ep);
   TU_LOG2("  Open EP %02X with Size = %u\r\n", desc_ep->bEndpointAddress, max_packet_size);
+  TU_ASSERT(max_packet_size > 0);
 
   switch (desc_ep->bmAttributes.xfer) {
     case TUSB_XFER_ISOCHRONOUS: {
-      uint16_t const spec_size = (speed == TUSB_SPEED_HIGH ? 1024 : 1023);
+      const uint16_t spec_size = (speed == TUSB_SPEED_HIGH ? 1024 : 1023);
       TU_ASSERT(max_packet_size <= spec_size);
       break;
     }
@@ -204,13 +258,13 @@ bool tu_edpt_validate(tusb_desc_endpoint_t const* desc_ep, tusb_speed_t speed) {
         // Bulk highspeed must be EXACTLY 512
         TU_ASSERT(max_packet_size == 512);
       } else {
-        // TODO Bulk fullspeed can only be 8, 16, 32, 64
-        TU_ASSERT(max_packet_size <= 64);
+        // Bulk fullspeed can only be 8, 16, 32, 64
+        TU_ASSERT(max_packet_size == 8 || max_packet_size == 16 || max_packet_size == 32 || max_packet_size == 64);
       }
       break;
 
     case TUSB_XFER_INTERRUPT: {
-      uint16_t const spec_size = (speed == TUSB_SPEED_HIGH ? 1024 : 64);
+      const uint16_t spec_size = (speed == TUSB_SPEED_HIGH ? 1024 : 64);
       TU_ASSERT(max_packet_size <= spec_size);
       break;
     }
@@ -221,117 +275,100 @@ bool tu_edpt_validate(tusb_desc_endpoint_t const* desc_ep, tusb_speed_t speed) {
 
   return true;
 }
+#endif
 
-void tu_edpt_bind_driver(uint8_t ep2drv[][2], tusb_desc_interface_t const* desc_itf, uint16_t desc_len,
-                         uint8_t driver_id) {
-  uint8_t const* p_desc = (uint8_t const*) desc_itf;
-  uint8_t const* desc_end = p_desc + desc_len;
+bool tu_bind_driver_to_ep_itf(uint8_t driver_id, uint8_t ep2drv[][2], uint8_t itf2drv[], uint8_t itf_max,
+                              uint8_t ep_max, const uint8_t *p_desc, uint16_t desc_len) {
+  const uint8_t *desc_end = p_desc + desc_len;
+  while (tu_desc_in_bounds(p_desc, desc_end)) {
+    const uint8_t desc_type = tu_desc_type(p_desc);
 
-  while (p_desc < desc_end) {
-    if (TUSB_DESC_ENDPOINT == tu_desc_type(p_desc)) {
-      uint8_t const ep_addr = ((tusb_desc_endpoint_t const*) p_desc)->bEndpointAddress;
-      TU_LOG(2, "  Bind EP %02x to driver id %u\r\n", ep_addr, driver_id);
-      ep2drv[tu_edpt_number(ep_addr)][tu_edpt_dir(ep_addr)] = driver_id;
+    if (desc_type == TUSB_DESC_ENDPOINT) {
+      const uint8_t ep_addr  = ((const tusb_desc_endpoint_t *)p_desc)->bEndpointAddress;
+      const uint8_t ep_num   = tu_edpt_number(ep_addr);
+      const uint8_t ep_dir   = tu_edpt_dir(ep_addr);
+      TU_ASSERT(ep_num < ep_max);
+      ep2drv[ep_num][ep_dir] = driver_id;
+    } else if (desc_type == TUSB_DESC_INTERFACE) {
+      const tusb_desc_interface_t *desc_itf = (const tusb_desc_interface_t *)p_desc;
+      if (desc_itf->bAlternateSetting == 0) {
+        TU_ASSERT(desc_itf->bInterfaceNumber < itf_max);
+        itf2drv[desc_itf->bInterfaceNumber] = driver_id;
+      }
     }
+
     p_desc = tu_desc_next(p_desc);
   }
-}
-
-uint16_t tu_desc_get_interface_total_len(tusb_desc_interface_t const* desc_itf, uint8_t itf_count, uint16_t max_len) {
-  uint8_t const* p_desc = (uint8_t const*) desc_itf;
-  uint16_t len = 0;
-
-  while (itf_count--) {
-    // Next on interface desc
-    len += tu_desc_len(desc_itf);
-    p_desc = tu_desc_next(p_desc);
-
-    while (len < max_len) {
-      // return on IAD regardless of itf count
-      if (tu_desc_type(p_desc) == TUSB_DESC_INTERFACE_ASSOCIATION) {
-        return len;
-      }
-      if ((tu_desc_type(p_desc) == TUSB_DESC_INTERFACE) &&
-          ((tusb_desc_interface_t const*) p_desc)->bAlternateSetting == 0) {
-        break;
-      }
-
-      len += tu_desc_len(p_desc);
-      p_desc = tu_desc_next(p_desc);
-    }
-  }
-
-  return len;
+  return true;
 }
 
 //--------------------------------------------------------------------+
 // Endpoint Stream Helper for both Host and Device stack
 //--------------------------------------------------------------------+
 
-bool tu_edpt_stream_init(tu_edpt_stream_t* s, bool is_host, bool is_tx, bool overwritable,
-                         void* ff_buf, uint16_t ff_bufsize, uint8_t* ep_buf, uint16_t ep_bufsize) {
+bool tu_edpt_stream_init(tu_edpt_stream_t *s, bool is_host, bool is_tx, bool overwritable, void *ff_buf,
+                         uint16_t ff_bufsize, uint8_t *ep_buf) {
   (void) is_tx;
 
+  if (ff_buf == NULL || ff_bufsize == 0) {
+    return false;
+  }
+
   s->is_host = is_host;
-  tu_fifo_config(&s->ff, ff_buf, ff_bufsize, 1, overwritable);
+  tu_fifo_config(&s->ff, ff_buf, ff_bufsize, overwritable);
 
   #if OSAL_MUTEX_REQUIRED
-  if (ff_buf && ff_bufsize) {
+  if (ff_buf != NULL && ff_bufsize > 0) {
     osal_mutex_t new_mutex = osal_mutex_create(&s->ff_mutexdef);
     tu_fifo_config_mutex(&s->ff, is_tx ? new_mutex : NULL, is_tx ? NULL : new_mutex);
   }
   #endif
 
   s->ep_buf = ep_buf;
-  s->ep_bufsize = ep_bufsize;
 
   return true;
 }
 
-bool tu_edpt_stream_deinit(tu_edpt_stream_t* s) {
-  (void) s;
-  #if OSAL_MUTEX_REQUIRED
-  if (s->ff.mutex_wr) osal_mutex_delete(s->ff.mutex_wr);
-  if (s->ff.mutex_rd) osal_mutex_delete(s->ff.mutex_rd);
+static bool stream_claim(tu_edpt_stream_t *s) {
+  TU_VERIFY(s->ep_addr != 0); // must be opened
+  if (s->is_host) {
+    #if CFG_TUH_ENABLED
+    return usbh_edpt_claim(s->hwid, s->ep_addr);
   #endif
-  return true;
-}
-
-TU_ATTR_ALWAYS_INLINE static inline bool stream_claim(uint8_t hwid, tu_edpt_stream_t* s) {
-  if (s->is_host) {
-    #if CFG_TUH_ENABLED
-    return usbh_edpt_claim(hwid, s->ep_addr);
-    #endif
   } else {
     #if CFG_TUD_ENABLED
-    return usbd_edpt_claim(hwid, s->ep_addr);
-    #endif
+    return usbd_edpt_claim(s->hwid, s->ep_addr);
+  #endif
   }
   return false;
 }
 
-TU_ATTR_ALWAYS_INLINE static inline bool stream_xfer(uint8_t hwid, tu_edpt_stream_t* s, uint16_t count) {
+static bool stream_xfer(tu_edpt_stream_t *s, uint16_t count) {
   if (s->is_host) {
     #if CFG_TUH_ENABLED
-    return usbh_edpt_xfer(hwid, s->ep_addr, count ? s->ep_buf : NULL, count);
-    #endif
+    return usbh_edpt_xfer(s->hwid, s->ep_addr, count ? s->ep_buf : NULL, count);
+  #endif
   } else {
     #if CFG_TUD_ENABLED
-    return usbd_edpt_xfer(hwid, s->ep_addr, count ? s->ep_buf : NULL, count);
-    #endif
+    if (s->ep_buf == NULL) {
+      return usbd_edpt_xfer_fifo(s->hwid, s->ep_addr, &s->ff, count, false);
+    } else {
+      return usbd_edpt_xfer(s->hwid, s->ep_addr, count ? s->ep_buf : NULL, count, false);
+    }
+  #endif
   }
   return false;
 }
 
-TU_ATTR_ALWAYS_INLINE static inline bool stream_release(uint8_t hwid, tu_edpt_stream_t* s) {
+static bool stream_release(tu_edpt_stream_t *s) {
   if (s->is_host) {
     #if CFG_TUH_ENABLED
-    return usbh_edpt_release(hwid, s->ep_addr);
-    #endif
+    return usbh_edpt_release(s->hwid, s->ep_addr);
+  #endif
   } else {
     #if CFG_TUD_ENABLED
-    return usbd_edpt_release(hwid, s->ep_addr);
-    #endif
+    return usbd_edpt_release(s->hwid, s->ep_addr);
+  #endif
   }
   return false;
 }
@@ -339,117 +376,84 @@ TU_ATTR_ALWAYS_INLINE static inline bool stream_release(uint8_t hwid, tu_edpt_st
 //--------------------------------------------------------------------+
 // Stream Write
 //--------------------------------------------------------------------+
-bool tu_edpt_stream_write_zlp_if_needed(uint8_t hwid, tu_edpt_stream_t* s, uint32_t last_xferred_bytes) {
+bool tu_edpt_stream_write_zlp_if_needed(tu_edpt_stream_t *s, uint32_t last_xferred_bytes) {
   // ZLP condition: no pending data, last transferred bytes is multiple of packet size
-  const uint16_t mps = s->is_mps512 ? TUSB_EPSIZE_BULK_HS : TUSB_EPSIZE_BULK_FS;
-  TU_VERIFY(!tu_fifo_count(&s->ff) && last_xferred_bytes && (0 == (last_xferred_bytes & (mps - 1))));
-  TU_VERIFY(stream_claim(hwid, s));
-  TU_ASSERT(stream_xfer(hwid, s, 0));
+  TU_VERIFY(tu_fifo_empty(&s->ff) && last_xferred_bytes > 0 && (0 == (last_xferred_bytes & (s->mps - 1))));
+  TU_VERIFY(stream_claim(s));
+  TU_ASSERT(stream_xfer(s, 0));
   return true;
 }
 
-uint32_t tu_edpt_stream_write_xfer(uint8_t hwid, tu_edpt_stream_t* s) {
-  // skip if no data
-  TU_VERIFY(tu_fifo_count(&s->ff), 0);
-
-  TU_VERIFY(stream_claim(hwid, s), 0);
+uint32_t tu_edpt_stream_write_xfer(tu_edpt_stream_t *s) {
+  const uint16_t ff_count = tu_fifo_count(&s->ff);
+  TU_VERIFY(ff_count > 0, 0); // skip if no data
+  TU_VERIFY(stream_claim(s), 0);
 
   // Pull data from FIFO -> EP buf
-  uint16_t const count = tu_fifo_read_n(&s->ff, s->ep_buf, s->ep_bufsize);
+  uint16_t count;
+  if (s->ep_buf == NULL) {
+    count = tu_fifo_count(&s->ff); // re-get count since fifo can be changed
+  } else {
+    count = tu_fifo_read_n(&s->ff, s->ep_buf, s->xfer_len);
+  }
 
-  if (count) {
-    TU_ASSERT(stream_xfer(hwid, s, count), 0);
+  if (count > 0) {
+    TU_ASSERT(stream_xfer(s, count), 0);
     return count;
   } else {
     // Release endpoint since we don't make any transfer
     // Note: data is dropped if terminal is not connected
-    stream_release(hwid, s);
+    stream_release(s);
     return 0;
   }
 }
 
-uint32_t tu_edpt_stream_write(uint8_t hwid, tu_edpt_stream_t* s, void const* buffer, uint32_t bufsize) {
-  TU_VERIFY(bufsize); // TODO support ZLP
+uint32_t tu_edpt_stream_write(tu_edpt_stream_t *s, const void *buffer, uint32_t bufsize) {
+  TU_VERIFY(bufsize > 0);
+  const uint16_t ret = tu_fifo_write_n(&s->ff, buffer, (uint16_t) tu_min32(bufsize, UINT16_MAX));
 
-  if (0 == tu_fifo_depth(&s->ff)) {
-    // no fifo for buffered
-    TU_VERIFY(stream_claim(hwid, s), 0);
-    const uint32_t xact_len = tu_min32(bufsize, s->ep_bufsize);
-    memcpy(s->ep_buf, buffer, xact_len);
-    TU_ASSERT(stream_xfer(hwid, s, (uint16_t) xact_len), 0);
-    return xact_len;
-  } else {
-    const uint16_t ret = tu_fifo_write_n(&s->ff, buffer, (uint16_t) bufsize);
-
-    // flush if fifo has more than packet size or
-    // in rare case: fifo depth is configured too small (which never reach packet size)
-    const uint16_t mps = s->is_mps512 ? TUSB_EPSIZE_BULK_HS : TUSB_EPSIZE_BULK_FS;
-    if ((tu_fifo_count(&s->ff) >= mps) || (tu_fifo_depth(&s->ff) < mps)) {
-      tu_edpt_stream_write_xfer(hwid, s);
-    }
-    return ret;
+  // flush if fifo has more than packet size or
+  // in rare case: fifo depth is configured too small (which never reach packet size)
+  if ((tu_fifo_count(&s->ff) >= s->mps) || (tu_fifo_depth(&s->ff) < s->mps)) {
+    tu_edpt_stream_write_xfer(s);
   }
+  return ret;
 }
 
-uint32_t tu_edpt_stream_write_available(uint8_t hwid, tu_edpt_stream_t* s) {
-  if (tu_fifo_depth(&s->ff)) {
-    return (uint32_t) tu_fifo_remaining(&s->ff);
-  } else {
-    bool is_busy = true;
-    if (s->is_host) {
-      #if CFG_TUH_ENABLED
-      is_busy = usbh_edpt_busy(hwid, s->ep_addr);
-      #endif
-    } else {
-      #if CFG_TUD_ENABLED
-      is_busy = usbd_edpt_busy(hwid, s->ep_addr);
-      #endif
-    }
-    return is_busy ? 0 : s->ep_bufsize;
-  }
+uint32_t tu_edpt_stream_write_available(tu_edpt_stream_t *s) {
+  return (uint32_t)tu_fifo_remaining(&s->ff);
 }
 
 //--------------------------------------------------------------------+
 // Stream Read
 //--------------------------------------------------------------------+
-uint32_t tu_edpt_stream_read_xfer(uint8_t hwid, tu_edpt_stream_t* s) {
-  if (0 == tu_fifo_depth(&s->ff)) {
-    // no fifo for buffered
-    TU_VERIFY(stream_claim(hwid, s), 0);
-    TU_ASSERT(stream_xfer(hwid, s, s->ep_bufsize), 0);
-    return s->ep_bufsize;
+uint32_t tu_edpt_stream_read_xfer(tu_edpt_stream_t *s) {
+  uint16_t available = tu_fifo_remaining(&s->ff);
+
+  // Prepare for incoming data but only allow what we can store in the ring buffer.
+  // TODO Actually we can still carry out the transfer, keeping count of received bytes
+  // and slowly move it to the FIFO when read().
+  // This pre-check reduces endpoint claiming
+  TU_VERIFY(available >= s->mps);
+  TU_VERIFY(stream_claim(s), 0);
+  available = tu_fifo_remaining(&s->ff); // re-get available since fifo can be changed
+
+  if (available >= s->mps) {
+    // multiple of packet size limit by ep bufsize
+    uint16_t count = (uint16_t) (available & ~(s->mps - 1));
+    count = tu_min16(count, s->xfer_len);
+    TU_ASSERT(stream_xfer(s, count), 0);
+    return count;
   } else {
-    const uint16_t mps = s->is_mps512 ? TUSB_EPSIZE_BULK_HS : TUSB_EPSIZE_BULK_FS;
-    uint16_t available = tu_fifo_remaining(&s->ff);
-
-    // Prepare for incoming data but only allow what we can store in the ring buffer.
-    // TODO Actually we can still carry out the transfer, keeping count of received bytes
-    // and slowly move it to the FIFO when read().
-    // This pre-check reduces endpoint claiming
-    TU_VERIFY(available >= mps);
-
-    TU_VERIFY(stream_claim(hwid, s), 0);
-
-    // get available again since fifo can be changed before endpoint is claimed
-    available = tu_fifo_remaining(&s->ff);
-
-    if (available >= mps) {
-      // multiple of packet size limit by ep bufsize
-      uint16_t count = (uint16_t) (available & ~(mps - 1));
-      count = tu_min16(count, s->ep_bufsize);
-      TU_ASSERT(stream_xfer(hwid, s, count), 0);
-      return count;
-    } else {
-      // Release endpoint since we don't make any transfer
-      stream_release(hwid, s);
-      return 0;
-    }
+    // Release endpoint since we don't make any transfer
+    stream_release(s);
+    return 0;
   }
 }
 
-uint32_t tu_edpt_stream_read(uint8_t hwid, tu_edpt_stream_t* s, void* buffer, uint32_t bufsize) {
-  uint32_t num_read = tu_fifo_read_n(&s->ff, buffer, (uint16_t) bufsize);
-  tu_edpt_stream_read_xfer(hwid, s);
+uint32_t tu_edpt_stream_read(tu_edpt_stream_t *s, void *buffer, uint32_t bufsize) {
+  const uint32_t num_read = tu_fifo_read_n(&s->ff, buffer, (uint16_t) tu_min32(bufsize, UINT16_MAX));
+  tu_edpt_stream_read_xfer(s);
   return num_read;
 }
 
@@ -479,7 +483,7 @@ char const* const tu_str_std_request[] = {
 };
 
 char const* const tu_str_xfer_result[] = {
-    "OK", "FAILED", "STALLED", "TIMEOUT"
+    "OK", "FAILED", "STALLED", "TIMEOUT", "ABORTED", "INVALID"
 };
 #endif
 
@@ -515,8 +519,12 @@ void tu_print_mem(void const* buf, uint32_t count, uint8_t indent) {
 
     if (i % item_per_line == 0) {
       // Print Ascii
-      if (i != 0) dump_str_line(buf8 - 16, 16);
-      for (uint8_t s = 0; s < indent; s++) tu_printf(" ");
+      if (i != 0) {
+        dump_str_line(buf8 - 16, 16);
+      }
+      for (uint8_t s = 0; s < indent; s++) {
+        tu_printf(" ");
+      }
       // print offset or absolute address
       tu_printf("%04X: ", 16 * i / item_per_line);
     }
@@ -531,10 +539,12 @@ void tu_print_mem(void const* buf, uint32_t count, uint8_t indent) {
   // fill up last row to 16 for printing ascii
   const uint32_t remain = count % 16;
   uint8_t nback = (uint8_t) (remain ? remain : 16);
-  if (remain) {
+  if (remain > 0) {
     for (uint32_t i = 0; i < 16 - remain; i++) {
       tu_printf(" ");
-      for (int j = 0; j < 2 * size; j++) tu_printf(" ");
+      for (int j = 0; j < 2 * size; j++) {
+        tu_printf(" ");
+      }
     }
   }
 
@@ -542,5 +552,238 @@ void tu_print_mem(void const* buf, uint32_t count, uint8_t indent) {
 }
 
 #endif
+
+#if CFG_TUSB_SYSVIEW_ENABLED
+
+#if defined(SYSVIEW_MANIFEST_BUILD) && defined(SYSVIEW_DISABLE_EVENTS) && !defined(SYSVIEW_DISABLE_EVENTS_FROM_BUILD)
+  // the SystemView capture takes its event filter from the build manifest (hw/bsp/sysview_manifest.cmake)
+  #error "SYSVIEW_DISABLE_EVENTS is set only through CMake's SYSVIEW_DISABLE_EVENTS (family_support.cmake)"
+#endif
+
+#if CFG_TUSB_OS == OPT_OS_FREERTOS
+// SYSVIEW_FREERTOS_H is the guard of SEGGER_SYSVIEW_FreeRTOS.h, which FreeRTOSConfig.h must include for its trace hooks
+#ifndef SYSVIEW_FREERTOS_H
+  #pragma message("SYSVIEW: FreeRTOSConfig.h does not include SEGGER_SYSVIEW_FreeRTOS.h, so the per-task CPU-load " \
+                  "table is empty. Wire it as hw/bsp/stm32f4/FreeRTOSConfig/FreeRTOSConfig.h does: its " \
+                  "FREERTOS_SYSVIEW_ENABLED block, the two INCLUDE_* options it sets, the closing include, and " \
+                  "configUSE_TRACE_FACILITY and configRECORD_STACK_HIGH_ADDRESS set to 1.")
+#endif
+extern const SEGGER_SYSVIEW_OS_API SYSVIEW_X_OS_TraceAPI;
+#define SYSVIEW_OS_API  (&SYSVIEW_X_OS_TraceAPI)
+#define SYSVIEW_OS_DESC ",O=FreeRTOS"
+#else
+#define SYSVIEW_OS_API  0
+#define SYSVIEW_OS_DESC ""
+#endif
+
+#ifndef SYSVIEW_APP_NAME
+#define SYSVIEW_APP_NAME    "TinyUSB"
+#endif
+#ifndef SYSVIEW_DEVICE_NAME
+#define SYSVIEW_DEVICE_NAME "Cortex-M"
+#endif
+#ifndef SYSVIEW_RAM_BASE
+#define SYSVIEW_RAM_BASE    (0x20000000)
+#endif
+
+// CPU clock (and DWT timestamp rate). Weak because non-CMSIS SDKs (Pico SDK) have no SystemCoreClock;
+// declared here since no single vendor header provides it.
+#if defined(__GNUC__)
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wredundant-decls"
+#endif
+extern uint32_t SystemCoreClock;
+#if defined(__GNUC__)
+  #pragma GCC diagnostic pop
+#endif
+
+TU_ATTR_WEAK uint32_t tusb_sysview_cpu_freq(void) {
+  return SystemCoreClock;
+}
+
+// Kernel objects named for SystemView, kept for the system description a later recorder connect
+// replays. Names must be static: only the pointer is kept.
+#define TU_SV_NAMED_MAX 4
+static struct {
+  const void* handle;
+  const char* name;
+} _sv_named[TU_SV_NAMED_MAX];
+static uint8_t _sv_named_count;
+
+void tu_sysview_name_resource(const void* handle, const char* name) {
+  if (handle == NULL || name == NULL) {
+    return; // silently ignored: naming is cosmetic, never worth failing a boot over
+  }
+  // a re-init (dynamic_switch's role switch) names the same static mutex again: update in place
+  for (uint8_t i = 0; i < _sv_named_count; i++) {
+    if (_sv_named[i].handle == handle) {
+      _sv_named[i].name = name;
+      SEGGER_SYSVIEW_NameResource((U32) (uintptr_t) handle, name);
+      return;
+    }
+  }
+  if (_sv_named_count >= TU_SV_NAMED_MAX) {
+    return; // table full and this is a genuinely new handle: drop it, cosmetic only
+  }
+  _sv_named[_sv_named_count].handle = handle;
+  _sv_named[_sv_named_count].name = name;
+  _sv_named_count++;
+  // sent now too: Start()'s system description already ran, before the stacks created their mutexes
+  SEGGER_SYSVIEW_NameResource((U32) (uintptr_t) handle, name);
+}
+
+static void send_sys_desc(void) {
+  SEGGER_SYSVIEW_SendSysDesc("N=" SYSVIEW_APP_NAME ",D=" SYSVIEW_DEVICE_NAME SYSVIEW_OS_DESC);
+  SEGGER_SYSVIEW_SendSysDesc("I#15=SysTick");
+  for (uint8_t i = 0; i < _sv_named_count; i++) {
+    SEGGER_SYSVIEW_NameResource((U32) (uintptr_t) _sv_named[i].handle, _sv_named[i].name);
+  }
+}
+
+TU_ATTR_WEAK uint32_t SEGGER_SYSVIEW_X_GetTimestampFreq(void) {
+#if defined(SEGGER_SYSVIEW_CORE) && (SEGGER_SYSVIEW_CORE == SEGGER_SYSVIEW_CORE_CM3)
+  // DWT cycle counter: SEGGER_SYSVIEW_ConfDefaults.h reads it inline, no BSP code needed.
+  return tusb_sysview_cpu_freq();
+#else
+  // No DWT CYCCNT (ARMv6-M, RISC-V): hw/bsp/<family>/family.c supplies SEGGER_SYSVIEW_X_GetTimestamp(),
+  // a free-running microsecond count; a family without one fails to link on that symbol.
+  return 1000000u;
+#endif
+}
+
+// Active interrupt id for cores ConfDefaults does not read ICSR on: RISC-V (mcause), or a Cortex-M
+// built as SEGGER_SYSVIEW_CORE_OTHER.
+#if !defined(SEGGER_SYSVIEW_CORE) || \
+    ((SEGGER_SYSVIEW_CORE != SEGGER_SYSVIEW_CORE_CM3) && (SEGGER_SYSVIEW_CORE != SEGGER_SYSVIEW_CORE_CM0))
+U32 SEGGER_SYSVIEW_X_GetInterruptId(void) {
+  #if defined(__riscv) || defined(__riscv__)
+  uint32_t mcause;
+  __asm volatile ("csrr %0, mcause" : "=r" (mcause));
+  return (U32) (mcause & 0xFFFu);
+  #elif defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7EM__) || defined(__ARM_ARCH_8M_MAIN__) || \
+        defined(__ARM_ARCH_8_1M_MAIN__) || defined(__ARM_ARCH_6M__) || defined(__ARM_ARCH_8M_BASE__)
+  // ICSR.VECTACTIVE: 9 bits on v7-M/v8-M mainline, 6 on v6-M (upper bits read 0)
+  return (*(volatile uint32_t*) 0xE000ED04u) & 0x1FFu;
+  #else
+  return 0; // unknown core: report "no interrupt" rather than a bogus id
+  #endif
+}
+#endif
+
+// Records only the outermost enter/exit: dual-role BSPs bracket their back-to-back self-wrapped
+// tud_/tuh_int_handler() calls, so one interrupt is one span. Volatile since nested USB IRQs (ch32v20x
+// LP/HP when an application gives them different preemption priorities) can both reach it; non-atomic on
+// purpose, as a lost update miscounts one span and recovers on the next balanced pair.
+static volatile uint8_t _sv_isr_depth;
+
+void tu_sysview_isr_enter(void) {
+  if (_sv_isr_depth++ == 0) {
+    SEGGER_SYSVIEW_RecordEnterISR();
+  }
+}
+
+// PendSV pending at the outermost exit means the ISR returns through the scheduler, not to the
+// task it preempted: record ExitISRToScheduler then, or SystemView shows a causeless switch.
+// Cortex-M only; RISC-V has no PendSV and takes the plain exit record.
+#if defined(SEGGER_SYSVIEW_CORE) && \
+    ((SEGGER_SYSVIEW_CORE == SEGGER_SYSVIEW_CORE_CM3) || (SEGGER_SYSVIEW_CORE == SEGGER_SYSVIEW_CORE_CM0))
+  #define SV_ICSR_PENDSVSET_PENDING() \
+    ((*(volatile uint32_t*) 0xE000ED04 /* SCB->ICSR */) & (1u << 28) /* PENDSVSET */)
+#endif
+
+void tu_sysview_isr_exit(void) {
+  if (_sv_isr_depth != 0 && --_sv_isr_depth == 0) {
+#if defined(SV_ICSR_PENDSVSET_PENDING)
+    if (SV_ICSR_PENDSVSET_PENDING()) {
+      SEGGER_SYSVIEW_RecordExitISRToScheduler();
+    } else {
+      SEGGER_SYSVIEW_RecordExitISR();
+    }
+#else
+    SEGGER_SYSVIEW_RecordExitISR();
+#endif
+  }
+}
+
+void tu_sysview_init(void) {
+  static bool inited = false;
+  if (inited) { return; }
+  inited = true;
+#if defined(SEGGER_SYSVIEW_CORE) && (SEGGER_SYSVIEW_CORE == SEGGER_SYSVIEW_CORE_CM3)
+  // DWT CYCCNT drives timestamps: enable it on target, not via a debugger (post-mortem too), unless
+  // DWT_CTRL.NOCYCCNT (bit 25) says the counter is absent.
+  (*(volatile unsigned int*) 0xE000EDFC) |= (1u << 24);   /* DEMCR.TRCENA */
+  if (((*(volatile unsigned int*) 0xE0001000) & (1u << 25)) == 0) {
+    (*(volatile unsigned int*) 0xE0001000) |= 1u;         /* DWT_CTRL.CYCCNTENA */
+  }
+#endif
+  SEGGER_SYSVIEW_Init(SEGGER_SYSVIEW_X_GetTimestampFreq(), tusb_sysview_cpu_freq(), SYSVIEW_OS_API, send_sys_desc);
+  SEGGER_SYSVIEW_SetRAMBase(SYSVIEW_RAM_BASE);
+  // no SEGGER_SYSVIEW_RegisterModule(): see TU_SV_EVENT_BASE
+  SEGGER_SYSVIEW_Start(); /* self-start: host recorders only drain */
+#ifdef SYSVIEW_DISABLE_EVENTS
+  SEGGER_SYSVIEW_DisableEvents(SYSVIEW_DISABLE_EVENTS);
+#endif
+}
+
+bool tu_sysview_stack_report_due(tusb_role_t role) {
+  static uint16_t count[2]; // device, host
+  return 0 == (++count[role == TUSB_ROLE_HOST] & 0x3FFu);
+}
+
+#if CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_USB && CFG_TUSB_OS == OPT_OS_FREERTOS
+void tu_sysview_stack_report(tusb_role_t role) {
+  if (!tu_sysview_stack_report_due(role)) {
+    return;
+  }
+// Bytes used at peak needs pxEndOfStack, which TaskStatus_t has only under this condition (task.h);
+// the SYSVIEW families' FreeRTOSConfig.h set configRECORD_STACK_HIGH_ADDRESS=1. Headroom alone would read as usage.
+#if (configUSE_TRACE_FACILITY == 1) && ((portSTACK_GROWTH > 0) || (configRECORD_STACK_HIGH_ADDRESS == 1))
+  // SEGGER's FreeRTOS task-table cap (family_support.cmake). Above it uxTaskGetSystemState() returns
+  // 0, not a truncated list, so nothing is reported.
+  #ifndef SYSVIEW_FREERTOS_MAX_NOF_TASKS
+  #define SYSVIEW_FREERTOS_MAX_NOF_TASKS 16
+  #endif
+  // static: 16 TaskStatus_t is ~700 bytes, too much for usbd's stack
+  static TaskStatus_t status[SYSVIEW_FREERTOS_MAX_NOF_TASKS];
+  static char names[SYSVIEW_FREERTOS_MAX_NOF_TASKS][configMAX_TASK_NAME_LEN];
+  // One task per call: a burst of SendTaskInfo() calls (each locking and writing the RTT ring)
+  // dropped same54_xplained off the bus.
+  static UBaseType_t next_idx = 0;
+  static UBaseType_t n = 0;
+  // usbd's and usbh's tasks both report, so the scheduler stays suspended across the whole report
+  // (single-core ports only). It also keeps vTaskDelete() of another task from freeing its TCB
+  // while its name is copied.
+  vTaskSuspendAll();
+  if (next_idx == 0) {
+    // the snapshot scans every stack, so take it once per lap
+    n = uxTaskGetSystemState(status, TU_ARRAY_SIZE(status), NULL);
+    for (UBaseType_t t = 0; t < n; t++) {
+      strncpy(names[t], status[t].pcTaskName, configMAX_TASK_NAME_LEN - 1);
+      names[t][configMAX_TASK_NAME_LEN - 1] = '\0';
+    }
+  }
+  if (n != 0) {
+    UBaseType_t const i = next_idx;
+    next_idx = (next_idx + 1 < n) ? next_idx + 1 : 0;
+
+    SEGGER_SYSVIEW_TASKINFO info = {0};
+    info.TaskID    = (U32)(uintptr_t) status[i].xHandle;
+    info.sName     = names[i];
+    info.Prio      = status[i].uxCurrentPriority;
+    info.StackBase = (U32)(uintptr_t) status[i].pxStackBase;
+    uint32_t const free_bytes = status[i].usStackHighWaterMark * sizeof(StackType_t);
+    uint32_t const stack_size = (uint32_t)(uintptr_t) status[i].pxEndOfStack -
+                                 (uint32_t)(uintptr_t) status[i].pxStackBase + sizeof(StackType_t);
+    info.StackSize  = stack_size;
+    info.StackUsage = (free_bytes < stack_size) ? (stack_size - free_bytes) : 0;
+    SEGGER_SYSVIEW_SendTaskInfo(&info);
+  }
+  (void) xTaskResumeAll();
+#endif
+}
+#endif
+
+#endif // CFG_TUSB_SYSVIEW_ENABLED
 
 #endif // host or device enabled

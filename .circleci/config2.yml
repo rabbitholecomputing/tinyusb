@@ -1,5 +1,10 @@
 version: 2.1
 
+parameters:
+  example-map:
+    type: string
+    default: "{}"  # example-map-default: rewritten in-place by config.yml set-matrix
+
 commands:
   setup-toolchain:
     parameters:
@@ -7,28 +12,9 @@ commands:
             type: string
 
     steps:
-      - run:
-          name: Set toolchain url and key
-          command: |
-            TOOLCHAIN_JSON='{
-              "aarch64-gcc": "https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-aarch64-none-elf.tar.xz",
-              "arm-clang": "https://github.com/ARM-software/LLVM-embedded-toolchain-for-Arm/releases/download/release-17.0.1/LLVMEmbeddedToolchainForArm-17.0.1-Linux-x86_64.tar.xz",
-              "arm-gcc": "https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v12.3.1-1.1/xpack-arm-none-eabi-gcc-12.3.1-1.1-linux-x64.tar.gz",
-              "msp430-gcc": "http://software-dl.ti.com/msp430/msp430_public_sw/mcu/msp430/MSPGCC/9_2_0_0/export/msp430-gcc-9.2.0.50_linux64.tar.bz2",
-              "riscv-gcc": "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v13.2.0-2/xpack-riscv-none-elf-gcc-13.2.0-2-linux-x64.tar.gz",
-              "rx-gcc": "https://llvm-gcc-renesas.com/downloads/get.php?f=rx/8.3.0.202004-gnurx/gcc-8.3.0.202004-GNURX-ELF.run"
-            }'
-            toolchain_url=$(echo $TOOLCHAIN_JSON | jq -r '.["<< parameters.toolchain >>"]')
-
-            # only cache if not a github link
-            if [[ $toolchain_url != "https://github.com"* ]]; then
-              echo "<< parameters.toolchain >>-$toolchain_url" > toolchain_key
-            fi
-            echo "export toolchain_url=$toolchain_url" >> $BASH_ENV
-
       - restore_cache:
           name: Restore Toolchain Cache
-          key: deps-{{ checksum "toolchain_key" }}
+          key: deps-<< parameters.toolchain >>-{{ checksum ".github/actions/setup_toolchain/toolchain.json" }}
           paths:
             - ~/cache/<< parameters.toolchain >>
 
@@ -38,22 +24,38 @@ commands:
             # download if folder does not exist (not cached)
             if [ ! -d ~/cache/<< parameters.toolchain >> ]; then
               mkdir -p ~/cache/<< parameters.toolchain >>
-              wget --progress=dot:giga $toolchain_url -O toolchain.tar.gz
+              fetch=.github/actions/setup_toolchain/download/fetch.sh
               if [[ << parameters.toolchain >> == rx-gcc ]]; then
-                mv toolchain.tar.gz toolchain.run
+                $fetch << parameters.toolchain >> toolchain.run
                 chmod +x toolchain.run
                 ./toolchain.run -p ~/cache/<< parameters.toolchain >>/gnurx -y
+              elif [[ << parameters.toolchain >> == ft9xx-gcc ]]; then
+                $fetch << parameters.toolchain >> ~/cache/<< parameters.toolchain >>/ft9xxtoolchain.deb
+              elif [[ << parameters.toolchain >> == arm-iar ]]; then
+                $fetch iar-lmsc-tools ~/cache/<< parameters.toolchain >>/iar-lmsc-tools.deb
+                $fetch << parameters.toolchain >> ~/cache/<< parameters.toolchain >>/toolchain.deb
               else
+                $fetch << parameters.toolchain >> toolchain.tar.gz
                 tar -C ~/cache/<< parameters.toolchain >> -xaf toolchain.tar.gz
               fi
             fi
 
             # Add toolchain to PATH
-            echo "export PATH=$PATH:`echo ~/cache/<< parameters.toolchain >>/*/bin`" >> $BASH_ENV
+            if [[ << parameters.toolchain >> == arm-iar ]]; then
+              # Install IAR since we only cache deb file
+              sudo dpkg -i ~/cache/<< parameters.toolchain >>/iar-lmsc-tools.deb
+              sudo dpkg --ignore-depends=libusb-1.0-0 -i ~/cache/<< parameters.toolchain >>/toolchain.deb
+              echo "export PATH=$PATH:/opt/iar/cxarm/arm/bin" >> $BASH_ENV
+            elif [[ << parameters.toolchain >> == ft9xx-gcc ]]; then
+              sudo apt install -y ~/cache/<< parameters.toolchain >>/ft9xxtoolchain.deb
+              echo "export PATH=$PATH:/opt/ft32/bin" >> $BASH_ENV
+            else
+              echo "export PATH=$PATH:`echo ~/cache/<< parameters.toolchain >>/*/bin`" >> $BASH_ENV
+            fi
 
       - save_cache:
           name: Save Toolchain Cache
-          key: deps-{{ checksum "toolchain_key" }}
+          key: deps-<< parameters.toolchain >>-{{ checksum ".github/actions/setup_toolchain/toolchain.json" }}
           paths:
             - ~/cache/<< parameters.toolchain >>
 
@@ -65,6 +67,9 @@ commands:
         type: string
       family:
         type: string
+      build-args:
+        type: string
+        default: ""
 
     steps:
       - checkout
@@ -89,7 +94,7 @@ commands:
 
             # Install Pico SDK
             if [ << parameters.family >> == "rp2040" ]; then
-              git clone --depth 1 https://github.com/raspberrypi/pico-sdk.git ~/pico-sdk
+              git clone --depth 1 --branch 2.3.1 https://github.com/raspberrypi/pico-sdk.git ~/pico-sdk  # keep in step with .github/actions/get_deps/action.yml
               echo "export PICO_SDK_PATH=~/pico-sdk" >> $BASH_ENV
             fi
 
@@ -103,18 +108,43 @@ commands:
 
       - run:
           name: Build
+          no_output_timeout: 20m
+          environment:
+            EXAMPLE_MAP: << pipeline.parameters.example-map >>
           command: |
+            # PR example filter for this family ('{}' or a missing key = build all).
+            # The map is the PR-derived value, so it must ride via env rather than
+            # shell-text interpolation (unsafe characters); family is a job
+            # parameter with charset [a-z0-9_], safe to interpolate directly.
+            EX_ARGS=$(printf '%s' "$EXAMPLE_MAP" | jq -r --arg fam "<< parameters.family >>" '(.[$fam] // []) | map("-e " + .) | join(" ")' 2>/dev/null) || EX_ARGS=''
+            # same screen as build_util.yml's: the values are example dir names from the
+            # PR checkout and $EX_ARGS is used unquoted below, so a glob metacharacter
+            # would pathname-expand against the build cwd. Dropping the filter builds
+            # everything - the safe direction, and what GHA does for the same input.
+            case "$EX_ARGS" in
+              *[!-A-Za-z0-9_/\ ]*)
+                echo "warning: unexpected characters in the example filter - building all examples"
+                EX_ARGS='' ;;
+            esac
+
             if [ << parameters.toolchain >> == esp-idf ]; then
-              docker run --rm -v $PWD:/project -w /project espressif/idf:v5.3.1 python tools/build.py << parameters.family >>
+              ESP_IDF_IMAGE=$(jq -er '."esp-idf".image' .github/actions/setup_toolchain/toolchain.json)
+              docker run --rm -v $PWD:/project -w /project "$ESP_IDF_IMAGE" python tools/build.py << parameters.build-args >> --target all $EX_ARGS << parameters.family >>
             else
               # Toolchain option default is gcc
               if [ << parameters.toolchain >> == arm-clang ]; then
                 TOOLCHAIN_OPTION="--toolchain clang"
+              elif [ << parameters.toolchain >> == arm-iar ]; then
+                TOOLCHAIN_OPTION="--toolchain iar"
+                iccarm --version
               elif [ << parameters.toolchain >> == arm-gcc ]; then
                 TOOLCHAIN_OPTION="--toolchain gcc"
               fi
 
-              python tools/build.py -s << parameters.build-system >> $TOOLCHAIN_OPTION << parameters.family >>
+              # circleci docker return $nproc as 36 core, limit parallel to 4 (resource-class = large)
+              # Required for IAR, also prevent crashed/killed by docker
+              BUILD_PY_ARGS="-s << parameters.build-system >> $TOOLCHAIN_OPTION -j 4 << parameters.build-args >> --target all"
+              python tools/build.py $BUILD_PY_ARGS $EX_ARGS << parameters.family >>
             fi
 
 jobs:
@@ -123,16 +153,20 @@ jobs:
     parameters:
       resource_class:
         type: string
-        default: medium+
+        default: large
       build-system:
         type: string
       toolchain:
         type: string
       family:
         type: string
+      build-args:
+        type: string
+        default: ""
 
     docker:
       - image: cimg/base:current
+    working_directory: ~/project/tinyusb
     resource_class: << parameters.resource_class >>
 
     steps:
@@ -140,6 +174,7 @@ jobs:
           build-system: << parameters.build-system >>
           toolchain: << parameters.toolchain >>
           family: << parameters.family >>
+          build-args: << parameters.build-args >>
 
   # Build using VM
   build-vm:
@@ -153,9 +188,13 @@ jobs:
         type: string
       family:
         type: string
+      build-args:
+        type: string
+        default: ""
 
     machine:
       image: ubuntu-2404:current
+    working_directory: ~/project/tinyusb
     resource_class: << parameters.resource_class >>
 
     steps:
@@ -163,21 +202,27 @@ jobs:
           build-system: << parameters.build-system >>
           toolchain: << parameters.toolchain >>
           family: << parameters.family >>
+          build-args: << parameters.build-args >>
+
+  no-op:
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - run:
+          name: No families selected
+          command: echo "PR selection - no families to build on CircleCI"
 
 workflows:
   build:
     jobs:
+# The jobs below are populated dynamically by config.yml set-matrix job
+# Example entries that will be generated:
 #      - build:
 #          matrix:
+#            alias: build-cmake-arm-gcc
 #            parameters:
 #              toolchain: [ 'arm-gcc' ]
 #              build-system: [ 'cmake' ]
 #              family: [ 'nrf' ]
-#              resource_class: ['large']
-#      - build-vm:
-#          matrix:
-#            parameters:
-#              toolchain: ['esp-idf']
-#              build-system: ['cmake']
-#              family: ['-bespressif_kaluga_1']
 #              resource_class: ['large']

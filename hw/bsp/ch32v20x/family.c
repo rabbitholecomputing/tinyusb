@@ -1,3 +1,7 @@
+/* metadata:
+manufacturer: WCH
+*/
+
 #include <stdio.h>
 
 // https://github.com/openwch/ch32v307/pull/90
@@ -8,6 +12,7 @@
 #endif
 
 #include "ch32v20x.h"
+#include "ch32v20x_it.h"
 
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
@@ -16,61 +21,74 @@
 #include "bsp/board_api.h"
 #include "board.h"
 
-/* CH32v203 depending on variants can support 2 USB IPs: FSDEV and USBFS.
+/* CH32v203 depending on variants can support 2 USB IPs: FSDEV (port0) and USBFS (port1).
  * By default, we use FSDEV, but you can explicitly select by define:
  * - CFG_TUD_WCH_USBIP_FSDEV
  * - CFG_TUD_WCH_USBIP_USBFS
  */
 
-// USBFS
-__attribute__((interrupt)) __attribute__((used))
-void USBHD_IRQHandler(void) {
+// Port0: USBD (fsdev). The USBD raises three IRQ lines (LP/HP/WakeUp) that all funnel into the
+// non-reentrant tud_int_handler. They nest only if given different preemption bits: at their reset
+// PFIC_IPRIOR of 0 none preempts another (QingKe V4 manual 3.3). The startup enables nesting and HWSTK; the
+// mainline toolchain's plain __attribute__((interrupt)) emits a software prologue that fights the
+// hardware context stack and corrupts the return on nesting. Emit naked handlers that rely on
+// HWSTK for context save/restore (equivalent to WCH's "WCH-Interrupt-fast"), which nests safely.
+#if CFG_TUD_ENABLED && CFG_TUD_WCH_USBIP_FSDEV
+  #if CFG_TUSB_SYSVIEW >= CFG_TUSB_SYSVIEW_LEVEL_ISR
+  // Naked asm cannot expand tud_int_handler()'s SystemView bracket, so it calls this C wrapper.
+  static void fsdev_dcd_int_handler(uint8_t rhport) {
+    tud_int_handler(rhport);
+  }
+    #define FSDEV_ISR_TARGET fsdev_dcd_int_handler
+  #else
+    #define FSDEV_ISR_TARGET dcd_int_handler
+  #endif
+  // The `call` below lives inside naked asm where LTO cannot see it; without a compiler-visible
+  // reference, -flto builds (make) internalize/drop the symbol and the link fails.
+  TU_ATTR_USED static void (*const fsdev_isr_keep)(uint8_t) = FSDEV_ISR_TARGET;
+  #define FSDEV_NAKED_ISR(name) \
+    __attribute__((naked)) __attribute__((used)) void name(void) { \
+      __asm volatile("li a0, 0\n\t call " TU_XSTRING(FSDEV_ISR_TARGET) "\n\t mret"); }
+#else
+  #define FSDEV_NAKED_ISR(name) \
+    __attribute__((naked)) __attribute__((used)) void name(void) { __asm volatile("mret"); }
+#endif
+FSDEV_NAKED_ISR(USB_LP_CAN1_RX0_IRQHandler)
+FSDEV_NAKED_ISR(USB_HP_CAN1_TX_IRQHandler)
+FSDEV_NAKED_ISR(USBWakeUp_IRQHandler)
+
+// Port1: USBFS
+__attribute__((interrupt)) __attribute__((used)) void USBHD_IRQHandler(void) {
+  // one SystemView span for both roles' self-wrapped handlers (tu_sysview_isr_enter)
+  TU_SYSVIEW_ISR_ENTER();
+  #if CFG_TUD_ENABLED && CFG_TUD_WCH_USBIP_USBFS
+  tud_int_handler(1);
+  #endif
+
+  #if CFG_TUH_ENABLED
+  tuh_int_handler(1);
+  #endif
+  TU_SYSVIEW_ISR_EXIT();
+}
+
+__attribute__((interrupt)) __attribute__((used)) void USBHDWakeUp_IRQHandler(void) {
   #if CFG_TUD_WCH_USBIP_USBFS
   tud_int_handler(0);
   #endif
 }
 
-__attribute__((interrupt)) __attribute__((used))
-void USBHDWakeUp_IRQHandler(void) {
-  #if CFG_TUD_WCH_USBIP_USBFS
-  tud_int_handler(0);
-  #endif
-}
-
-// USBD (fsdev)
-__attribute__((interrupt)) __attribute__((used))
-void USB_LP_CAN1_RX0_IRQHandler(void) {
-  #if CFG_TUD_WCH_USBIP_FSDEV
-  tud_int_handler(0);
-  #endif
-}
-
-__attribute__((interrupt)) __attribute__((used))
-void USB_HP_CAN1_TX_IRQHandler(void) {
-  #if CFG_TUD_WCH_USBIP_FSDEV
-  tud_int_handler(0);
-  #endif
-
-}
-
-__attribute__((interrupt)) __attribute__((used))
-void USBWakeUp_IRQHandler(void) {
-  #if CFG_TUD_WCH_USBIP_FSDEV
-  tud_int_handler(0);
-  #endif
-}
-
-
+//--------------------------------------------------------------------+
+// Board API
+//--------------------------------------------------------------------+
 #if CFG_TUSB_OS == OPT_OS_NONE
 volatile uint32_t system_ticks = 0;
 
-__attribute__((interrupt))
-void SysTick_Handler(void) {
+__attribute__((interrupt)) void SysTick_Handler(void) {
   SysTick->SR = 0;
   system_ticks++;
 }
 
-uint32_t SysTick_Config(uint32_t ticks) {
+static uint32_t SysTick_Config(uint32_t ticks) {
   NVIC_EnableIRQ(SysTicK_IRQn);
   SysTick->CTLR = 0;
   SysTick->SR = 0;
@@ -80,9 +98,37 @@ uint32_t SysTick_Config(uint32_t ticks) {
   return 0;
 }
 
-uint32_t board_millis(void) {
+uint32_t tusb_time_millis_api(void) {
   return system_ticks;
 }
+#endif
+
+#if CFG_TUSB_SYSVIEW_ENABLED && CFG_TUSB_OS == OPT_OS_NONE
+// SystemView timestamp in microseconds (src/tusb.c): RISC-V has no DWT, so it composes the 1 ms
+// system_ticks with SysTick CNT, which hardware reloads to 0 every millisecond.
+uint32_t SEGGER_SYSVIEW_X_GetTimestamp(void) {
+  // SystemCoreClock is the SysTick clock; the clock is fixed after board_init()
+  static uint32_t cycles_per_us;
+  if (cycles_per_us == 0) {
+    cycles_per_us = SystemCoreClock / 1000000u;
+  }
+  uint32_t ms, cnt, pend;
+  do { // re-read the tick: CNT wraps to 0 exactly when system_ticks increments
+    ms = system_ticks;
+    // Callers hold SEGGER_RTT_LOCK(), so a wrap's tick IRQ can be pending: SR bit 0 (CNTIF) latches
+    // the wrap. SR before CNT: a wrap between the two reads must not pair a pre-wrap CNT with a
+    // post-wrap pending flag (that adds a phantom ~1 ms)
+    pend = SysTick->SR & 1u;
+    cnt = (uint32_t) SysTick->CNT;
+  } while (ms != system_ticks || pend != (SysTick->SR & 1u));
+  uint32_t t = (ms + (pend ? 1u : 0u)) * 1000u + (cycles_per_us ? cnt / cycles_per_us : 0);
+  static uint32_t last; // monotonic clamp; callers are serialized by the RTT lock
+  if ((int32_t) (t - last) < 0) { t = last; }
+  last = t;
+  return t;
+}
+#elif CFG_TUSB_SYSVIEW_ENABLED
+#error "SYSVIEW on ch32v20x needs the bare-metal SysTick tick; not ported for this RTOS yet"
 #endif
 
 void board_init(void) {
@@ -92,11 +138,11 @@ void board_init(void) {
   SysTick_Config(SystemCoreClock / 1000);
 #endif
 
-  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+  LED_CLOCK_EN();
 
   GPIO_InitTypeDef GPIO_InitStructure = {
     .GPIO_Pin = LED_PIN,
-    .GPIO_Mode = GPIO_Mode_Out_OD,
+    .GPIO_Mode = LED_MODE,
     .GPIO_Speed = GPIO_Speed_10MHz,
   };
   GPIO_Init(LED_PORT, &GPIO_InitStructure);
@@ -104,7 +150,7 @@ void board_init(void) {
 #ifdef UART_DEV
   UART_CLOCK_EN();
   GPIO_InitTypeDef usart_init = {
-    .GPIO_Pin = UART_TX_PIN,
+    .GPIO_Pin = UART_TX_PIN | UART_RX_PIN,
     .GPIO_Speed = GPIO_Speed_50MHz,
     .GPIO_Mode = GPIO_Mode_AF_PP,
   };
@@ -115,7 +161,7 @@ void board_init(void) {
     .USART_WordLength = USART_WordLength_8b,
     .USART_StopBits = USART_StopBits_1,
     .USART_Parity = USART_Parity_No,
-    .USART_Mode = USART_Mode_Tx,
+    .USART_Mode = USART_Mode_Tx | USART_Mode_Rx,
     .USART_HardwareFlowControl = USART_HardwareFlowControl_None,
   };
   USART_Init(UART_DEV, &usart);
@@ -185,25 +231,36 @@ size_t board_get_unique_id(uint8_t id[], size_t max_len) {
 }
 
 int board_uart_read(uint8_t *buf, int len) {
-  (void) buf;
-  (void) len;
+#ifdef UART_DEV
+  int count;
+  for (count = 0; count < len; count++) {
+    if (USART_GetFlagStatus(UART_DEV, USART_FLAG_RXNE) == RESET) {
+      break;
+    }
+    buf[count] = USART_ReceiveData(UART_DEV);
+  }
+  return count;
+#else
+  (void) buf; (void) len;
   return 0;
+#endif
 }
 
 int board_uart_write(void const *buf, int len) {
 #ifdef UART_DEV
-  const char *bufc = (const char *) buf;
-  for (int i = 0; i < len; i++) {
-    while (USART_GetFlagStatus(UART_DEV, USART_FLAG_TC) == RESET);
-    USART_SendData(UART_DEV, *bufc++);
+  uint8_t const *p = (uint8_t const *) buf;
+  int count = 0;
+  while (count < len) {
+    if (USART_GetFlagStatus(UART_DEV, USART_FLAG_TC) != RESET) {
+      USART_SendData(UART_DEV, p[count]);
+      count++;
+    } else {
+      break;
+    }
   }
+  return count;
 #else
   (void) buf; (void) len;
+  return -1;
 #endif
-
-  return len;
 }
-
-//--------------------------------------------------------------------
-// Neopixel
-//--------------------------------------------------------------------
